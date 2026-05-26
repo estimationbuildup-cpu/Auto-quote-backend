@@ -1,0 +1,17 @@
+{
+  "name": "buildup-ai-backend",
+  "version": "1.0.0",
+  "description": "Buildup Auto Quote AI backend",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "openai": "^6.38.0"
+  }
+}
