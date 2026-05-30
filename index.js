@@ -1301,6 +1301,147 @@ async function syncSnapshotBusinessData(snapshot = {}, req) {
   await upsertQuotesToSupabase(state.savedQuotes, leadMap, req);
 }
 
+function getCustomerDisplayName(customer = {}) {
+  return String(customer.name || customer.customerName || customer.clientName || customer.customer_name || "").trim();
+}
+
+function normalizeCustomerRequestRecord(payload = {}) {
+  const customer = payload.customer && typeof payload.customer === "object" ? payload.customer : {};
+  const estimateData = payload.estimate_data || payload.estimateData || {};
+  const conversation = payload.conversation || payload.messages || [];
+  return {
+    customer_name: getCustomerDisplayName(customer) || payload.customer_name || null,
+    phone: customer.phone || payload.phone || null,
+    email: customer.email || payload.email || null,
+    location: customer.location || customer.address || payload.location || null,
+    project_type: customer.projectType || customer.project_type || payload.project_type || null,
+    conversation: Array.isArray(conversation) ? conversation : [],
+    estimate_data: {
+      ...estimateData,
+      chatId: payload.chatId || estimateData.chatId || null,
+      eventType: payload.eventType || estimateData.eventType || null,
+      note: payload.note || estimateData.note || null,
+      items: payload.items || estimateData.items || [],
+      rows: payload.rows || estimateData.rows || [],
+      roughAmount: payload.roughAmount ?? estimateData.roughAmount ?? null,
+      quoteNumber: payload.quoteNumber || estimateData.quoteNumber || null,
+      uploadedFiles: payload.uploadedFiles || estimateData.uploadedFiles || [],
+      locationLink: payload.locationLink || estimateData.locationLink || null,
+      siteVisit: payload.siteVisit || estimateData.siteVisit || null,
+      createdFrom: payload.createdFrom || estimateData.createdFrom || "auto_quote_chat",
+    },
+    status: payload.status || estimateData.status || "chat_updated",
+    assigned_to: isUuid(payload.assigned_to) ? payload.assigned_to : null,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+async function recordCustomerRequest(payload = {}, req = null) {
+  const record = normalizeCustomerRequestRecord(payload);
+  if (!SUPABASE_ENABLED) {
+    const file = path.join(DATA_DIR, "customer-requests.json");
+    const existing = readJsonFile(file, []);
+    existing.push({
+      id: `customer_request_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      created_at: new Date().toISOString(),
+      ...record,
+    });
+    writeJsonFile(file, existing.slice(-1000));
+    return existing[existing.length - 1];
+  }
+  const saved = await dbInsert("customer_requests", [{ ...record, created_at: new Date().toISOString() }]);
+  const row = Array.isArray(saved) && saved.length ? saved[0] : record;
+  await writeAuditLog(req, {
+    action_type: record.status || "customer_request_updated",
+    module: "auto_quote",
+    target_table: "customer_requests",
+    target_id: row.id || record.estimate_data?.chatId || null,
+    new_snapshot: row,
+    change_summary: `Customer request updated: ${record.status || "chat_updated"}${record.customer_name ? ` for ${record.customer_name}` : ""}`,
+  });
+  return row;
+}
+
+function dedupeCustomerRequests(rows = []) {
+  const map = new Map();
+  rows.forEach((row) => {
+    const key = row?.estimate_data?.chatId || row?.id;
+    if (!key) return;
+    const prev = map.get(key);
+    const rowTime = new Date(row.updated_at || row.created_at || 0).getTime();
+    const prevTime = prev ? new Date(prev.updated_at || prev.created_at || 0).getTime() : -1;
+    if (!prev || rowTime >= prevTime) map.set(key, row);
+  });
+  return [...map.values()].sort((a, b) => new Date(b.updated_at || b.created_at || 0) - new Date(a.updated_at || a.created_at || 0));
+}
+
+function notificationSectionsFromRequests(rows = []) {
+  const deduped = dedupeCustomerRequests(rows);
+  const statusOf = (row) => String(row?.status || row?.estimate_data?.eventType || "").toLowerCase();
+  return {
+    all: deduped,
+    realAgent: deduped.filter((row) => statusOf(row).includes("agent")),
+    aiSubmitted: deduped.filter((row) => statusOf(row).includes("submitted")),
+    needsReview: deduped.filter((row) => statusOf(row).includes("review")),
+    locationSiteWork: deduped.filter((row) => {
+      const status = statusOf(row);
+      return status.includes("location") || status.includes("site_visit") || status.includes("document") || Boolean(row.location || row?.estimate_data?.locationLink || row?.estimate_data?.siteVisit);
+    }),
+  };
+}
+
+async function loadCustomerRequestRows(limit = 120) {
+  if (!SUPABASE_ENABLED) {
+    return readJsonFile(path.join(DATA_DIR, "customer-requests.json"), []);
+  }
+  const rows = await dbSelect("customer_requests", `select=*&order=updated_at.desc&limit=${Number(limit) || 120}`);
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function readSiteVisitBookings() {
+  const fallback = { bookings: [] };
+  if (!SUPABASE_ENABLED) return readJsonFile(path.join(DATA_DIR, "site-visit-bookings.json"), fallback);
+  const rows = await dbSelect("app_settings", "select=setting_value&setting_key=eq.site_visit_bookings&limit=1");
+  return Array.isArray(rows) && rows[0]?.setting_value ? rows[0].setting_value : fallback;
+}
+
+async function writeSiteVisitBookings(value = {}, req = null) {
+  const data = { bookings: Array.isArray(value.bookings) ? value.bookings : [], updatedAt: new Date().toISOString() };
+  if (!SUPABASE_ENABLED) {
+    writeJsonFile(path.join(DATA_DIR, "site-visit-bookings.json"), data);
+    return data;
+  }
+  const actor = actorFromRequest(req);
+  await dbUpsert("app_settings", [{
+    setting_key: "site_visit_bookings",
+    setting_value: data,
+    updated_by: actor.id,
+    updated_by_name: actor.name,
+    updated_at: new Date().toISOString(),
+  }], { onConflict: "setting_key", returning: false });
+  return data;
+}
+
+function generateSiteVisitSlots(bookings = []) {
+  const booked = new Set((bookings || []).filter((b) => b.status !== "cancelled").map((b) => b.slotId));
+  const slotHours = ["10:00", "12:00", "15:00", "16:30"];
+  const slots = [];
+  const today = new Date();
+  for (let dayOffset = 1; dayOffset <= 10 && slots.length < 18; dayOffset += 1) {
+    const d = new Date(today);
+    d.setDate(today.getDate() + dayOffset);
+    const weekday = d.getDay();
+    if (weekday === 0) continue; // keep Sundays out by default
+    const date = d.toISOString().slice(0, 10);
+    slotHours.forEach((time) => {
+      const slotId = `${date} ${time}`;
+      if (!booked.has(slotId)) slots.push({ slotId, date, time, label: `${date} at ${time}` });
+    });
+  }
+  return slots.slice(0, 12);
+}
+
+
 async function auditQuoteChanges(previousState, nextState, req) {
   const oldQuotes = new Map((previousState.savedQuotes || []).map((q, i) => [quoteIdentity(q, i), q]));
   const newQuotes = new Map((nextState.savedQuotes || []).map((q, i) => [quoteIdentity(q, i), q]));
@@ -1827,6 +1968,112 @@ app.get("/audit-logs", requireStaff, async (req, res) => {
   }
 });
 
+app.post("/customer-request", async (req, res) => {
+  try {
+    const row = await recordCustomerRequest(req.body || {}, req);
+    res.json({ ok: true, success: true, request: row });
+  } catch (error) {
+    rememberSupabaseIssue("customer request save", error);
+    res.status(500).json({ ok: false, success: false, error: "Could not save customer request to the database." });
+  }
+});
+
+app.post("/customer-document", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const file = body.file || {};
+    const uploadedFile = {
+      id: `doc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      name: file.name || body.name || "uploaded-file",
+      type: file.type || body.type || "application/octet-stream",
+      size: Number(file.size || body.size || 0) || 0,
+      uploadedAt: new Date().toISOString(),
+      dataUrl: file.dataUrl || body.dataUrl || null,
+    };
+    const row = await recordCustomerRequest({
+      chatId: body.chatId,
+      customer: body.customer || {},
+      conversation: body.messages || [],
+      status: "document_uploaded",
+      eventType: "document_uploaded",
+      note: `Customer uploaded ${uploadedFile.name}`,
+      uploadedFiles: [uploadedFile],
+      estimate_data: { uploadedFiles: [uploadedFile], documentReviewRequired: true },
+    }, req);
+    res.json({ ok: true, success: true, file: uploadedFile, request: row });
+  } catch (error) {
+    rememberSupabaseIssue("customer document upload", error);
+    res.status(500).json({ ok: false, success: false, error: "Could not save uploaded document." });
+  }
+});
+
+app.get("/notifications", requireStaff, async (req, res) => {
+  try {
+    const rows = await loadCustomerRequestRows(150);
+    const sections = notificationSectionsFromRequests(rows);
+    res.json({
+      ok: true,
+      success: true,
+      databaseEnabled: SUPABASE_ENABLED,
+      sections,
+      agentRequests: handoffRequests.slice(-50).reverse(),
+    });
+  } catch (error) {
+    rememberSupabaseIssue("notifications load", error);
+    res.status(500).json({ ok: false, success: false, error: "Could not load notifications from the database." });
+  }
+});
+
+app.get("/site-visit-slots", async (req, res) => {
+  try {
+    const data = await readSiteVisitBookings();
+    const slots = generateSiteVisitSlots(data.bookings || []);
+    res.json({ ok: true, success: true, slots });
+  } catch (error) {
+    rememberSupabaseIssue("site visit slots", error);
+    res.status(500).json({ ok: false, success: false, error: "Could not load available site visit slots." });
+  }
+});
+
+app.post("/site-visit-booking", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const slot = body.slot || {};
+    const slotId = slot.slotId || body.slotId;
+    if (!slotId) return res.status(400).json({ ok: false, success: false, error: "Missing site visit slot." });
+    const data = await readSiteVisitBookings();
+    const bookings = Array.isArray(data.bookings) ? data.bookings : [];
+    const existing = bookings.find((booking) => booking.slotId === slotId && booking.status !== "cancelled");
+    if (existing) return res.status(409).json({ ok: false, success: false, error: "This site visit slot is already booked." });
+    const booking = {
+      id: `site_visit_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      slotId,
+      date: slot.date || body.date || null,
+      time: slot.time || body.time || null,
+      label: slot.label || body.label || slotId,
+      customer: body.customer || {},
+      chatId: body.chatId || null,
+      status: "booked",
+      createdAt: new Date().toISOString(),
+    };
+    await writeSiteVisitBookings({ bookings: [...bookings, booking] }, req);
+    await recordCustomerRequest({
+      chatId: body.chatId,
+      customer: body.customer || {},
+      conversation: body.messages || [],
+      status: "site_visit_booked",
+      eventType: "site_visit_booked",
+      siteVisit: booking,
+      note: `Customer booked site visit: ${booking.label}`,
+    }, req);
+    res.json({ ok: true, success: true, booking });
+  } catch (error) {
+    rememberSupabaseIssue("site visit booking", error);
+    res.status(500).json({ ok: false, success: false, error: "Could not book site visit." });
+  }
+});
+
+
 app.get("/local-backup", requireStaff, (req, res) => {
   const data = readJsonFile(LOCAL_BACKUP_FILE, { ok: false, message: "No local backup found yet." });
   res.json({ ok: true, data });
@@ -1888,7 +2135,7 @@ app.get("/agent-requests", requireStaff, (req, res) => {
   res.json({ success: true, requests: handoffRequests.slice(-50).reverse() });
 });
 
-app.post("/agent-request", (req, res) => {
+app.post("/agent-request", async (req, res) => {
   const body = req.body || {};
   const request = {
     id: `handoff_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
@@ -1899,6 +2146,19 @@ app.post("/agent-request", (req, res) => {
     note: normalizeContent(body.note || "Customer requested a real staff member."),
   };
   handoffRequests.push(request);
+  try {
+    await recordCustomerRequest({
+      chatId: body.chatId || body.id || null,
+      customer: request.customer,
+      conversation: request.messages,
+      status: "real_agent_requested",
+      eventType: "real_agent_requested",
+      note: request.note,
+      estimate_data: { handoffRequest: request },
+    }, req);
+  } catch (error) {
+    rememberSupabaseIssue("agent request save", error);
+  }
   res.json({ success: true, request, staffContactName: STAFF_CONTACT_NAME, staffContactPhone: STAFF_CONTACT_PHONE });
 });
 
