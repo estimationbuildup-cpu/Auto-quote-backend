@@ -25,6 +25,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DATA_DIR = path.join(__dirname, "data");
 const LOCAL_BACKUP_FILE = path.join(DATA_DIR, "app-data.json");
+const STAFF_PROFILE_USERS_FILE = path.join(DATA_DIR, "staff-users.json");
+const DEFAULT_STAFF_PROFILE_NAMES = ["Sameer", "Sajid", "Rasheed", "Jithin", "Arafat"];
 
 const allowedOrigins = (process.env.CORS_ORIGINS || "https://buildupuae.com,https://www.buildupuae.com,https://auto-quote-backend.onrender.com")
   .split(",")
@@ -58,6 +60,121 @@ function readJsonFile(filePath, fallback = null) {
     return JSON.parse(fs.readFileSync(filePath, "utf8"));
   } catch {
     return fallback;
+  }
+}
+
+function normalizeStaffProfileName(value = "") {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/\w/g, (char) => char.toUpperCase());
+}
+
+function staffProfileIdFromName(name = "") {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || `user-${Date.now().toString(36)}`;
+}
+
+function hashStaffProfilePassword(password = "") {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.pbkdf2Sync(String(password), salt, 100000, 64, "sha512").toString("hex");
+  return { salt, hash };
+}
+
+function verifyStaffProfilePassword(password = "", profile = {}) {
+  if (!profile?.salt || !profile?.passwordHash) return false;
+  const candidate = crypto.pbkdf2Sync(String(password), profile.salt, 100000, 64, "sha512").toString("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(candidate, "hex"), Buffer.from(profile.passwordHash, "hex"));
+  } catch {
+    return false;
+  }
+}
+
+function readStoredStaffProfiles() {
+  const stored = readJsonFile(STAFF_PROFILE_USERS_FILE, []);
+  return Array.isArray(stored) ? stored : [];
+}
+
+function saveStoredStaffProfiles(profiles) {
+  writeJsonFile(STAFF_PROFILE_USERS_FILE, Array.isArray(profiles) ? profiles : []);
+}
+
+function getStaffProfiles() {
+  const stored = readStoredStaffProfiles();
+  const byName = new Map();
+
+  DEFAULT_STAFF_PROFILE_NAMES.forEach((name) => {
+    const cleanName = normalizeStaffProfileName(name);
+    byName.set(cleanName.toLowerCase(), {
+      id: staffProfileIdFromName(cleanName),
+      name: cleanName,
+      defaultUser: true,
+      hasPassword: false,
+    });
+  });
+
+  stored.forEach((profile) => {
+    const cleanName = normalizeStaffProfileName(profile?.name);
+    if (!cleanName) return;
+    byName.set(cleanName.toLowerCase(), {
+      id: profile.id || staffProfileIdFromName(cleanName),
+      name: cleanName,
+      defaultUser: DEFAULT_STAFF_PROFILE_NAMES.some((item) => item.toLowerCase() === cleanName.toLowerCase()),
+      hasPassword: Boolean(profile.passwordHash && profile.salt),
+      createdAt: profile.createdAt || null,
+      updatedAt: profile.updatedAt || null,
+    });
+  });
+
+  return Array.from(byName.values()).sort((a, b) => {
+    const ai = DEFAULT_STAFF_PROFILE_NAMES.findIndex((name) => name.toLowerCase() === a.name.toLowerCase());
+    const bi = DEFAULT_STAFF_PROFILE_NAMES.findIndex((name) => name.toLowerCase() === b.name.toLowerCase());
+    if (ai >= 0 || bi >= 0) return (ai >= 0 ? ai : 999) - (bi >= 0 ? bi : 999);
+    return a.name.localeCompare(b.name);
+  });
+}
+
+function findStoredStaffProfile(name = "") {
+  const cleanName = normalizeStaffProfileName(name);
+  if (!cleanName) return null;
+  return readStoredStaffProfiles().find((profile) => String(profile?.name || "").trim().toLowerCase() === cleanName.toLowerCase()) || null;
+}
+
+function createOrUpdateStaffProfile({ name, password }) {
+  const cleanName = normalizeStaffProfileName(name);
+  const cleanPassword = String(password || "");
+  if (!cleanName) throw new Error("Staff user name is required.");
+  if (cleanPassword.length < 4) throw new Error("Staff user password must be at least 4 characters.");
+
+  const profiles = readStoredStaffProfiles();
+  const now = new Date().toISOString();
+  const existingIndex = profiles.findIndex((profile) => String(profile?.name || "").trim().toLowerCase() === cleanName.toLowerCase());
+  const { salt, hash } = hashStaffProfilePassword(cleanPassword);
+  const nextProfile = {
+    id: existingIndex >= 0 ? (profiles[existingIndex].id || staffProfileIdFromName(cleanName)) : `${staffProfileIdFromName(cleanName)}-${Date.now().toString(36)}`,
+    name: cleanName,
+    passwordHash: hash,
+    salt,
+    createdAt: existingIndex >= 0 ? profiles[existingIndex].createdAt || now : now,
+    updatedAt: now,
+  };
+
+  if (existingIndex >= 0) profiles[existingIndex] = nextProfile;
+  else profiles.push(nextProfile);
+  saveStoredStaffProfiles(profiles);
+  return { id: nextProfile.id, name: nextProfile.name };
+}
+
+function setActiveProfileForRequest(req, user) {
+  const token = getStaffToken(req);
+  const session = token ? staffSessions.get(token) : null;
+  if (session && user?.name) {
+    session.activeUser = { id: user.id || staffProfileIdFromName(user.name), name: user.name };
+    staffSessions.set(token, session);
   }
 }
 
@@ -524,7 +641,44 @@ app.post("/staff-login", (req, res) => {
 });
 
 app.get("/staff-session", requireStaff, (req, res) => {
-  res.json({ success: true, ok: true, staff: { email: req.staff.email, name: req.staff.name, role: req.staff.role } });
+  res.json({
+    success: true,
+    ok: true,
+    staff: { email: req.staff.email, name: req.staff.name, role: req.staff.role },
+    activeUser: req.staff.activeUser || null,
+  });
+});
+
+app.get("/staff-users", requireStaff, (req, res) => {
+  res.json({ success: true, ok: true, users: getStaffProfiles() });
+});
+
+app.post("/staff-users/login", requireStaff, (req, res) => {
+  const name = normalizeStaffProfileName(req.body?.name);
+  const password = String(req.body?.password || "");
+  const profile = findStoredStaffProfile(name);
+
+  if (!profile || !profile.passwordHash) {
+    return res.status(404).json({ success: false, ok: false, error: "This staff user does not have a password yet. Create the password first." });
+  }
+
+  if (!verifyStaffProfilePassword(password, profile)) {
+    return res.status(401).json({ success: false, ok: false, error: "Incorrect user password." });
+  }
+
+  const user = { id: profile.id || staffProfileIdFromName(profile.name), name: profile.name };
+  setActiveProfileForRequest(req, user);
+  res.json({ success: true, ok: true, user });
+});
+
+app.post("/staff-users", requireStaff, (req, res) => {
+  try {
+    const user = createOrUpdateStaffProfile({ name: req.body?.name, password: req.body?.password });
+    setActiveProfileForRequest(req, user);
+    res.json({ success: true, ok: true, user, users: getStaffProfiles() });
+  } catch (error) {
+    res.status(400).json({ success: false, ok: false, error: error.message || "Could not create staff user." });
+  }
 });
 
 app.get("/health", (req, res) => {
@@ -551,8 +705,11 @@ app.get("/local-backup/download", requireStaff, (req, res) => {
 
 app.post("/local-backup", requireStaff, (req, res) => {
   const payload = req.body || {};
+  const headerUserName = String(req.headers["x-staff-user"] || "").trim();
+  const headerUserId = String(req.headers["x-staff-user-id"] || "").trim();
   const snapshot = {
     ...payload,
+    actor: req.staff?.activeUser || (headerUserName ? { id: headerUserId || staffProfileIdFromName(headerUserName), name: headerUserName } : null),
     backendSavedAt: new Date().toISOString(),
   };
   writeJsonFile(LOCAL_BACKUP_FILE, snapshot);
