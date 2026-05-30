@@ -37,6 +37,11 @@ const FRONTEND_ROWS_STORAGE_KEY = "estimation-grid-rows-v8";
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || "";
 const SUPABASE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+
+const ASSISTANT_DISABLE_PHRASE = String(process.env.ASSISTANT_DISABLE_PHRASE || process.env.AI_DISABLE_PHRASE || "").trim();
+const ASSISTANT_ENABLE_PHRASE = String(process.env.ASSISTANT_ENABLE_PHRASE || process.env.AI_ENABLE_PHRASE || "").trim();
+const ASSISTANT_CONTROL_STATUS_KEY = "assistant_global_control";
+const ASSISTANT_DISABLED_MESSAGE = process.env.ASSISTANT_DISABLED_MESSAGE || "Auto quote support is temporarily unavailable. Please share your name, phone number, location, and requirement. Our team will review it and get back to you.";
 let latestSupabaseIssue = null;
 
 function rememberSupabaseIssue(context, error) {
@@ -625,6 +630,11 @@ function activeStaffCanManageUsers(req) {
 
 function activeStaffIsOwner(req) {
   return activeStaffCanManageUsers(req);
+}
+
+function activeStaffCanControlAssistant(req) {
+  const active = getActiveStaffProfile(req);
+  return Boolean(active?.id === BUILT_IN_AUTHORITY_PROFILE_ID || isOwnerStaffProfileName(active?.name));
 }
 
 function getConfiguredStaffUsers() {
@@ -1494,6 +1504,73 @@ async function writeSiteVisitBookings(value = {}, req = null) {
   return data;
 }
 
+async function readAssistantControlStatus() {
+  const fallback = { enabled: true, updatedAt: null, updatedBy: null };
+  if (!SUPABASE_ENABLED) {
+    return readJsonFile(path.join(DATA_DIR, "assistant-control.json"), fallback) || fallback;
+  }
+  try {
+    const rows = await dbSelect("app_settings", `select=setting_value&setting_key=eq.${ASSISTANT_CONTROL_STATUS_KEY}&limit=1`);
+    return Array.isArray(rows) && rows[0]?.setting_value ? { ...fallback, ...rows[0].setting_value } : fallback;
+  } catch (error) {
+    rememberSupabaseIssue("assistant control status load", error);
+    return fallback;
+  }
+}
+
+async function writeAssistantControlStatus(value = {}) {
+  const data = {
+    enabled: value.enabled !== false,
+    updatedAt: new Date().toISOString(),
+    updatedBy: value.updatedBy || "verified-control-phrase",
+  };
+  if (!SUPABASE_ENABLED) {
+    writeJsonFile(path.join(DATA_DIR, "assistant-control.json"), data);
+    return data;
+  }
+  await dbUpsert("app_settings", [{
+    setting_key: ASSISTANT_CONTROL_STATUS_KEY,
+    setting_value: data,
+    updated_by_name: data.updatedBy || "System",
+    updated_at: new Date().toISOString(),
+  }], { onConflict: "setting_key", returning: false });
+  return data;
+}
+
+function matchesSecretPhrase(input = "", phrase = "") {
+  const text = String(input || "").trim();
+  const secret = String(phrase || "").trim();
+  if (!text || !secret) return false;
+  if (text.length === secret.length) {
+    try {
+      if (crypto.timingSafeEqual(Buffer.from(text), Buffer.from(secret))) return true;
+    } catch {}
+  }
+  return text.toLowerCase() === secret.toLowerCase();
+}
+
+async function handleAssistantControlCommand(text = "") {
+  if (ASSISTANT_DISABLE_PHRASE && matchesSecretPhrase(text, ASSISTANT_DISABLE_PHRASE)) {
+    const status = await writeAssistantControlStatus({ enabled: false });
+    return {
+      handled: true,
+      enabled: false,
+      status,
+      message: "Quote support has been paused for maintenance.",
+    };
+  }
+  if (ASSISTANT_ENABLE_PHRASE && matchesSecretPhrase(text, ASSISTANT_ENABLE_PHRASE)) {
+    const status = await writeAssistantControlStatus({ enabled: true });
+    return {
+      handled: true,
+      enabled: true,
+      status,
+      message: "Quote support has been resumed.",
+    };
+  }
+  return { handled: false };
+}
+
 function generateSiteVisitSlots(bookings = []) {
   const booked = new Set((bookings || []).filter((b) => b.status !== "cancelled").map((b) => b.slotId));
   // Site visits are offered from 8 AM to 4 PM only.
@@ -2069,6 +2146,73 @@ app.get("/audit-logs", requireStaff, async (req, res) => {
 });
 
 
+app.get("/assistant-control-admin", requireStaff, async (req, res) => {
+  try {
+    if (!activeStaffCanControlAssistant(req)) {
+      return res.status(403).json({ ok: false, success: false, error: "This control is restricted." });
+    }
+    const status = await readAssistantControlStatus();
+    res.json({
+      ok: true,
+      success: true,
+      enabled: status.enabled !== false,
+      status,
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, success: false, error: "Could not check quote support status." });
+  }
+});
+
+app.patch("/assistant-control-admin", requireStaff, async (req, res) => {
+  try {
+    if (!activeStaffCanControlAssistant(req)) {
+      return res.status(403).json({ ok: false, success: false, error: "This control is restricted." });
+    }
+    const active = getActiveStaffProfile(req);
+    const enabled = req.body?.enabled !== false;
+    const status = await writeAssistantControlStatus({ enabled, updatedBy: active?.name || "Staff" });
+    await writeAuditLog(req, {
+      action_type: enabled ? "assistant_support_enabled" : "assistant_support_disabled",
+      module: "assistant_control",
+      target_table: "app_settings",
+      target_id: ASSISTANT_CONTROL_STATUS_KEY,
+      field_name: "enabled",
+      old_value: null,
+      new_value: String(enabled),
+      new_snapshot: status,
+      change_summary: `${active?.name || "Staff"} ${enabled ? "enabled" : "paused"} Auto Quote support.`,
+    });
+    res.json({ ok: true, success: true, enabled: status.enabled !== false, status });
+  } catch (error) {
+    console.error("Assistant admin control error:", error);
+    res.status(500).json({ ok: false, success: false, error: "Could not update quote support control." });
+  }
+});
+
+app.get("/assistant-control-status", async (req, res) => {
+  try {
+    const status = await readAssistantControlStatus();
+    res.json({ ok: true, success: true, enabled: status.enabled !== false });
+  } catch (error) {
+    res.status(500).json({ ok: false, success: false, error: "Could not check quote support status." });
+  }
+});
+
+app.post("/assistant-control", async (req, res) => {
+  try {
+    const text = normalizeContent(req.body?.message || req.body?.text || "").trim();
+    const result = await handleAssistantControlCommand(text);
+    if (!result.handled) {
+      return res.json({ ok: true, success: true, handled: false });
+    }
+    // Do not store the command text, do not send it to OpenAI, and do not create a customer request.
+    return res.json({ ok: true, success: true, handled: true, enabled: result.enabled, message: result.message });
+  } catch (error) {
+    console.error("Assistant control error:", error);
+    res.status(500).json({ ok: false, success: false, error: "Assistant control request failed." });
+  }
+});
+
 app.get("/customer-chat-session/:chatId", async (req, res) => {
   try {
     const chatId = String(req.params.chatId || "").trim();
@@ -2384,6 +2528,28 @@ app.post("/ai-estimate", async (req, res) => {
 
     if (!prompt && !messages.length) {
       return res.status(400).json({ success: false, error: "Send either prompt or messages." });
+    }
+
+    if (mode === "customer") {
+      const control = await handleAssistantControlCommand(prompt);
+      if (control.handled) {
+        return res.json({
+          success: true,
+          controlHandled: true,
+          assistantEnabled: control.enabled,
+          reply: control.message,
+          result: { reply: control.message, mode: "assistant_control" },
+        });
+      }
+      const assistantStatus = await readAssistantControlStatus();
+      if (assistantStatus.enabled === false) {
+        return res.json({
+          success: true,
+          assistantDisabled: true,
+          reply: ASSISTANT_DISABLED_MESSAGE,
+          result: { reply: ASSISTANT_DISABLED_MESSAGE, mode: "assistant_disabled", questions: [] },
+        });
+      }
     }
 
     let result;
