@@ -1342,28 +1342,31 @@ function normalizeCustomerRequestRecord(payload = {}) {
 }
 
 function customerConversationMessageKey(message = {}) {
+  // Do not include timestamp/id in the key. The duplicate bug created the same visible
+  // message with different timestamps, so timestamp-based keys failed to remove repeats.
   return [
     String(message.sender || message.role || "").trim().toLowerCase(),
-    String(message.content || message.text || "").trim(),
-    String(message.at || "").slice(0, 19),
+    String(message.content || message.text || "").replace(/\s+/g, " ").trim().toLowerCase(),
   ].join("|");
 }
 
 function mergeCustomerConversations(previousConversation = [], incomingConversation = []) {
-  const previous = Array.isArray(previousConversation) ? previousConversation : [];
-  const incoming = Array.isArray(incomingConversation) ? incomingConversation : [];
-  if (!previous.length) return incoming;
-  if (!incoming.length) return previous;
+  const combined = [
+    ...(Array.isArray(previousConversation) ? previousConversation : []),
+    ...(Array.isArray(incomingConversation) ? incomingConversation : []),
+  ];
+  const seen = new Set();
+  const merged = [];
 
-  const seen = new Set(previous.map(customerConversationMessageKey));
-  const merged = [...previous];
-  for (const message of incoming) {
-    const key = customerConversationMessageKey(message);
-    if (!seen.has(key)) {
-      seen.add(key);
-      merged.push(message);
-    }
+  for (const message of combined) {
+    const text = String(message?.content || message?.text || "").replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    const key = customerConversationMessageKey({ ...message, content: text, text });
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push({ ...message, content: message.content ?? text, text: message.text ?? text });
   }
+
   return merged.sort((a, b) => {
     const at = new Date(a?.at || 0).getTime();
     const bt = new Date(b?.at || 0).getTime();
