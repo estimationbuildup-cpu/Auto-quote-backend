@@ -28,6 +28,12 @@ const LOCAL_BACKUP_FILE = path.join(DATA_DIR, "app-data.json");
 const STAFF_PROFILE_USERS_FILE = path.join(DATA_DIR, "staff-users.json");
 const DEFAULT_STAFF_PROFILE_NAMES = ["Sameer", "Sajid", "Rasheed", "Jithin", "Arafat"];
 const STAFF_OWNER_PROFILE_NAME = normalizeStaffProfileName(process.env.STAFF_OWNER_PROFILE_NAME || "Sameer");
+const FRONTEND_SETTINGS_STORAGE_KEY = "estimation-grid-pro-v2";
+const FRONTEND_QUOTATION_STORAGE_KEY = "estimation-grid-quotation-v2";
+const FRONTEND_ROWS_STORAGE_KEY = "estimation-grid-rows-v8";
+const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || "";
+const SUPABASE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
 
 const allowedOrigins = (process.env.CORS_ORIGINS || "https://buildupuae.com,https://www.buildupuae.com,https://auto-quote-backend.onrender.com")
   .split(",")
@@ -64,6 +70,113 @@ function readJsonFile(filePath, fallback = null) {
   }
 }
 
+function isUuid(value = "") {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ""));
+}
+
+function stableStringify(value) {
+  if (value === null || value === undefined) return String(value);
+  if (typeof value !== "object") return String(value);
+  try {
+    return JSON.stringify(value, Object.keys(value).sort());
+  } catch {
+    return String(value);
+  }
+}
+
+function valueToAuditText(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "object") {
+    try { return JSON.stringify(value); } catch { return String(value); }
+  }
+  return String(value);
+}
+
+function supabaseHeaders(extra = {}) {
+  return {
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    ...extra,
+  };
+}
+
+async function supabaseRest(pathname, { method = "GET", body, headers = {} } = {}) {
+  if (!SUPABASE_ENABLED) throw new Error("Supabase is not configured. Add SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Render.");
+  const url = `${SUPABASE_URL}/rest/v1/${pathname}`;
+  const response = await fetch(url, {
+    method,
+    headers: supabaseHeaders(headers),
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await response.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch { data = text; }
+  }
+  if (!response.ok) {
+    const message = typeof data === "object" && data ? (data.message || data.error || JSON.stringify(data)) : (text || response.statusText);
+    throw new Error(`Supabase ${method} ${pathname} failed: ${message}`);
+  }
+  return data;
+}
+
+function encodeEq(value = "") {
+  return encodeURIComponent(String(value || ""));
+}
+
+async function dbSelect(table, query = "select=*") {
+  return supabaseRest(`${table}?${query}`, { method: "GET" });
+}
+
+async function dbInsert(table, rows, { returning = true } = {}) {
+  return supabaseRest(table, {
+    method: "POST",
+    body: rows,
+    headers: { Prefer: returning ? "return=representation" : "return=minimal" },
+  });
+}
+
+async function dbUpsert(table, rows, { onConflict, returning = true } = {}) {
+  const suffix = onConflict ? `?on_conflict=${encodeURIComponent(onConflict)}` : "";
+  return supabaseRest(`${table}${suffix}`, {
+    method: "POST",
+    body: rows,
+    headers: { Prefer: `resolution=merge-duplicates,${returning ? "return=representation" : "return=minimal"}` },
+  });
+}
+
+async function dbPatch(table, query, patch, { returning = true } = {}) {
+  return supabaseRest(`${table}?${query}`, {
+    method: "PATCH",
+    body: patch,
+    headers: { Prefer: returning ? "return=representation" : "return=minimal" },
+  });
+}
+
+async function dbDelete(table, query, { returning = true } = {}) {
+  return supabaseRest(`${table}?${query}`, {
+    method: "DELETE",
+    headers: { Prefer: returning ? "return=representation" : "return=minimal" },
+  });
+}
+
+function safeJsonParse(value, fallback = null) {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value !== "string") return value;
+  try { return JSON.parse(value); } catch { return fallback; }
+}
+
+function parseLocalStorageObject(snapshot = {}) {
+  const raw = snapshot?.localStorage && typeof snapshot.localStorage === "object" ? snapshot.localStorage : {};
+  const parsed = {};
+  Object.entries(raw).forEach(([key, value]) => {
+    parsed[key] = safeJsonParse(value, value);
+  });
+  return parsed;
+}
+
 function normalizeStaffProfileName(value = "") {
   return String(value || "")
     .trim()
@@ -95,26 +208,48 @@ function normalizeStaffProfileRole(role = "staff", name = "") {
 }
 
 function publicStaffProfile(profile = {}, options = {}) {
-  const cleanName = normalizeStaffProfileName(profile?.name);
-  const internalRole = normalizeStaffProfileRole(profile?.role, cleanName);
-  const canManageUsers = internalRole === "owner";
+  const cleanName = normalizeStaffProfileName(profile?.name || profile?.display_name);
+  const rawRole = profile?.role || "staff";
+  const internalRole = profile?.is_protected || isOwnerStaffProfileName(cleanName) || rawRole === "owner" ? "owner" : normalizeStaffProfileRole(rawRole, cleanName);
+  const canManageUsers = Boolean(profile?.canManageUsers || profile?.is_protected || internalRole === "owner");
   const displayRole = internalRole === "owner" ? "admin" : internalRole;
   const publicProfile = {
     id: profile.id || staffProfileIdFromName(cleanName),
     name: cleanName,
     role: displayRole,
     defaultUser: isDefaultStaffProfileName(cleanName),
-    hasPassword: Boolean(profile.passwordHash && profile.salt),
-    createdAt: profile.createdAt || null,
-    updatedAt: profile.updatedAt || null,
+    hasPassword: Boolean(profile.password_hash || profile.passwordHash || (profile.salt && profile.passwordHash)),
+    createdAt: profile.created_at || profile.createdAt || null,
+    updatedAt: profile.updated_at || profile.updatedAt || null,
   };
 
   if (options.includePermissions) {
     publicProfile.canManageUsers = canManageUsers;
-    publicProfile.protected = canManageUsers;
+    if (canManageUsers) publicProfile.protected = true;
   }
 
   return publicProfile;
+}
+
+function encodeStaffProfilePassword(password = "") {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const iterations = 100000;
+  const hash = crypto.pbkdf2Sync(String(password), salt, iterations, 64, "sha512").toString("hex");
+  return `pbkdf2_sha512$${iterations}$${salt}$${hash}`;
+}
+
+function verifyEncodedStaffProfilePassword(password = "", encoded = "") {
+  const parts = String(encoded || "").split("$");
+  if (parts.length !== 4 || parts[0] !== "pbkdf2_sha512") return false;
+  const iterations = Number(parts[1]) || 100000;
+  const salt = parts[2];
+  const storedHash = parts[3];
+  const candidate = crypto.pbkdf2Sync(String(password), salt, iterations, 64, "sha512").toString("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(candidate, "hex"), Buffer.from(storedHash, "hex"));
+  } catch {
+    return false;
+  }
 }
 
 function hashStaffProfilePassword(password = "") {
@@ -124,6 +259,7 @@ function hashStaffProfilePassword(password = "") {
 }
 
 function verifyStaffProfilePassword(password = "", profile = {}) {
+  if (profile?.password_hash) return verifyEncodedStaffProfilePassword(password, profile.password_hash);
   if (!profile?.salt || !profile?.passwordHash) return false;
   const candidate = crypto.pbkdf2Sync(String(password), profile.salt, 100000, 64, "sha512").toString("hex");
   try {
@@ -142,7 +278,7 @@ function saveStoredStaffProfiles(profiles) {
   writeJsonFile(STAFF_PROFILE_USERS_FILE, Array.isArray(profiles) ? profiles : []);
 }
 
-function getStaffProfiles() {
+function getFileStaffProfiles() {
   const stored = readStoredStaffProfiles();
   const byName = new Map();
 
@@ -161,12 +297,47 @@ function getStaffProfiles() {
     byName.set(cleanName.toLowerCase(), publicStaffProfile(profile));
   });
 
-  return Array.from(byName.values()).sort((a, b) => {
-    const ai = DEFAULT_STAFF_PROFILE_NAMES.findIndex((name) => name.toLowerCase() === a.name.toLowerCase());
-    const bi = DEFAULT_STAFF_PROFILE_NAMES.findIndex((name) => name.toLowerCase() === b.name.toLowerCase());
-    if (ai >= 0 || bi >= 0) return (ai >= 0 ? ai : 999) - (bi >= 0 ? bi : 999);
-    return a.name.localeCompare(b.name);
-  });
+  return Array.from(byName.values()).sort(sortStaffProfilesForDisplay);
+}
+
+function sortStaffProfilesForDisplay(a, b) {
+  const ai = DEFAULT_STAFF_PROFILE_NAMES.findIndex((name) => name.toLowerCase() === a.name.toLowerCase());
+  const bi = DEFAULT_STAFF_PROFILE_NAMES.findIndex((name) => name.toLowerCase() === b.name.toLowerCase());
+  if (ai >= 0 || bi >= 0) return (ai >= 0 ? ai : 999) - (bi >= 0 ? bi : 999);
+  return a.name.localeCompare(b.name);
+}
+
+async function ensureDefaultStaffProfilesInDb() {
+  if (!SUPABASE_ENABLED) return;
+  const names = Array.from(new Set([...DEFAULT_STAFF_PROFILE_NAMES, STAFF_OWNER_PROFILE_NAME].filter(Boolean)));
+  for (const name of names) {
+    const cleanName = normalizeStaffProfileName(name);
+    const existing = await dbSelect("staff_users", `select=id,display_name&display_name=eq.${encodeEq(cleanName)}&limit=1`);
+    if (Array.isArray(existing) && existing.length) {
+      if (isOwnerStaffProfileName(cleanName)) {
+        await dbPatch("staff_users", `display_name=eq.${encodeEq(cleanName)}`, { role: "owner", is_protected: true, status: "active", updated_at: new Date().toISOString() }, { returning: false });
+      }
+      continue;
+    }
+    await dbInsert("staff_users", [{
+      display_name: cleanName,
+      role: isOwnerStaffProfileName(cleanName) ? "owner" : "staff",
+      status: "active",
+      is_protected: isOwnerStaffProfileName(cleanName),
+    }], { returning: false });
+  }
+}
+
+async function getDbStaffProfiles({ includeInactive = false } = {}) {
+  await ensureDefaultStaffProfilesInDb();
+  const statusFilter = includeInactive ? "" : "&status=eq.active";
+  const rows = await dbSelect("staff_users", `select=*&order=created_at.asc${statusFilter}`);
+  return (Array.isArray(rows) ? rows : []).map((row) => publicStaffProfile(row)).sort(sortStaffProfilesForDisplay);
+}
+
+async function getStaffProfiles() {
+  if (SUPABASE_ENABLED) return getDbStaffProfiles();
+  return getFileStaffProfiles();
 }
 
 function findStoredStaffProfile(name = "") {
@@ -175,7 +346,18 @@ function findStoredStaffProfile(name = "") {
   return readStoredStaffProfiles().find((profile) => String(profile?.name || "").trim().toLowerCase() === cleanName.toLowerCase()) || null;
 }
 
-function createOrUpdateStaffProfile({ name, password, role = "staff", requirePassword = true }) {
+async function findStaffProfileRecord(name = "") {
+  const cleanName = normalizeStaffProfileName(name);
+  if (!cleanName) return null;
+  if (SUPABASE_ENABLED) {
+    await ensureDefaultStaffProfilesInDb();
+    const rows = await dbSelect("staff_users", `select=*&display_name=eq.${encodeEq(cleanName)}&status=eq.active&limit=1`);
+    return Array.isArray(rows) && rows.length ? rows[0] : null;
+  }
+  return findStoredStaffProfile(cleanName);
+}
+
+function createOrUpdateStaffProfileFile({ name, password, role = "staff", requirePassword = true }) {
   const cleanName = normalizeStaffProfileName(name);
   const cleanPassword = String(password || "");
   if (!cleanName) throw new Error("Staff user name is required.");
@@ -209,10 +391,47 @@ function createOrUpdateStaffProfile({ name, password, role = "staff", requirePas
   return publicStaffProfile(nextProfile);
 }
 
+async function createOrUpdateStaffProfile({ name, password, role = "staff", requirePassword = true, actor = null } = {}) {
+  const cleanName = normalizeStaffProfileName(name);
+  const cleanPassword = String(password || "");
+  if (!cleanName) throw new Error("Staff user name is required.");
+  if (requirePassword && cleanPassword.length < 4) throw new Error("Staff user password must be at least 4 characters.");
+  if (cleanPassword && cleanPassword.length < 4) throw new Error("Staff user password must be at least 4 characters.");
+
+  if (!SUPABASE_ENABLED) return createOrUpdateStaffProfileFile({ name: cleanName, password: cleanPassword, role, requirePassword });
+
+  await ensureDefaultStaffProfilesInDb();
+  const existingRows = await dbSelect("staff_users", `select=*&display_name=eq.${encodeEq(cleanName)}&limit=1`);
+  const existing = Array.isArray(existingRows) && existingRows.length ? existingRows[0] : null;
+  const now = new Date().toISOString();
+  const nextRole = normalizeStaffProfileRole(role || existing?.role || "staff", cleanName);
+  const patch = {
+    display_name: cleanName,
+    role: isOwnerStaffProfileName(cleanName) ? "owner" : nextRole,
+    status: "active",
+    is_protected: isOwnerStaffProfileName(cleanName) || Boolean(existing?.is_protected),
+    updated_at: now,
+  };
+  if (isUuid(actor?.id)) patch.updated_by = actor.id;
+  if (cleanPassword) patch.password_hash = encodeStaffProfilePassword(cleanPassword);
+
+  let saved;
+  if (existing?.id) {
+    const rows = await dbPatch("staff_users", `id=eq.${encodeEq(existing.id)}`, patch);
+    saved = Array.isArray(rows) && rows.length ? rows[0] : { ...existing, ...patch };
+  } else {
+    const insert = { ...patch, created_at: now };
+    if (isUuid(actor?.id)) insert.created_by = actor.id;
+    const rows = await dbInsert("staff_users", [insert]);
+    saved = Array.isArray(rows) && rows.length ? rows[0] : insert;
+  }
+  return publicStaffProfile(saved, { includePermissions: true });
+}
+
 function setActiveProfileForRequest(req, user) {
   const token = getStaffToken(req);
   const session = token ? staffSessions.get(token) : null;
-  if (session && user?.name) {
+  if (session && (user?.name || user?.display_name)) {
     const publicProfile = publicStaffProfile(user, { includePermissions: true });
     session.activeUser = {
       id: publicProfile.id,
@@ -630,6 +849,458 @@ function postProcessResult(parsed = {}, { mode, prompt, messages, customer }) {
   return next;
 }
 
+function actorFromRequest(req) {
+  const active = getActiveStaffProfile(req);
+  return {
+    id: isUuid(active?.id) ? active.id : null,
+    name: active?.name || req?.staff?.name || req?.headers?.["x-staff-user"] || "Staff",
+    role: active?.role || req?.staff?.role || "staff",
+  };
+}
+
+async function writeAuditLog(req, entry = {}) {
+  const actor = actorFromRequest(req);
+  const row = {
+    actor_user_id: actor.id,
+    actor_name: actor.name,
+    actor_role: actor.role,
+    action_type: entry.action_type || "updated",
+    module: entry.module || "general",
+    target_table: entry.target_table || null,
+    target_id: entry.target_id ? String(entry.target_id) : null,
+    quote_id: isUuid(entry.quote_id) ? entry.quote_id : null,
+    quote_number: entry.quote_number || null,
+    item_id: isUuid(entry.item_id) ? entry.item_id : null,
+    item_code: entry.item_code || null,
+    item_product: entry.item_product || null,
+    field_name: entry.field_name || null,
+    old_value: entry.old_value === undefined ? null : valueToAuditText(entry.old_value),
+    new_value: entry.new_value === undefined ? null : valueToAuditText(entry.new_value),
+    old_snapshot: entry.old_snapshot === undefined ? null : entry.old_snapshot,
+    new_snapshot: entry.new_snapshot === undefined ? null : entry.new_snapshot,
+    changed_fields: entry.changed_fields === undefined ? null : entry.changed_fields,
+    change_summary: entry.change_summary || null,
+    ip_address: req?.headers?.["x-forwarded-for"]?.split?.(",")?.[0]?.trim?.() || req?.ip || null,
+    device_info: req?.headers?.["user-agent"] || null,
+  };
+
+  if (!SUPABASE_ENABLED) {
+    const file = path.join(DATA_DIR, "audit-log.json");
+    const existing = readJsonFile(file, []);
+    existing.push({ id: `audit_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`, created_at: new Date().toISOString(), ...row });
+    writeJsonFile(file, existing.slice(-5000));
+    return null;
+  }
+
+  try {
+    await dbInsert("audit_logs", [row], { returning: false });
+  } catch (error) {
+    console.error("Audit log write failed:", error.message || error);
+  }
+  return null;
+}
+
+function shallowFieldDiff(oldObj = {}, newObj = {}, fields = []) {
+  const changes = [];
+  fields.forEach((field) => {
+    const oldValue = oldObj?.[field];
+    const newValue = newObj?.[field];
+    if (stableStringify(oldValue) !== stableStringify(newValue)) {
+      changes.push({ field, oldValue, newValue });
+    }
+  });
+  return changes;
+}
+
+function rowIdentity(row = {}, index = 0) {
+  return String(row.id || row.itemId || row.itemNo || row.code || row.tag || row.item_code || `row-${index}`);
+}
+
+function quoteIdentity(quote = {}, index = 0) {
+  return String(quote.id || quote.quoteNo || quote.quotation?.referenceNo || quote.autoDraftId || `quote-${index}`);
+}
+
+function leadIdentity(lead = {}, index = 0) {
+  return String(lead.id || lead.leadId || lead.phone || lead.name || `lead-${index}`);
+}
+
+function extractAppStateFromSnapshot(snapshot = {}) {
+  const local = parseLocalStorageObject(snapshot);
+  const settings = local[FRONTEND_SETTINGS_STORAGE_KEY] && typeof local[FRONTEND_SETTINGS_STORAGE_KEY] === "object" ? local[FRONTEND_SETTINGS_STORAGE_KEY] : {};
+  const quotation = local[FRONTEND_QUOTATION_STORAGE_KEY] && typeof local[FRONTEND_QUOTATION_STORAGE_KEY] === "object" ? local[FRONTEND_QUOTATION_STORAGE_KEY] : {};
+  const rows = Array.isArray(local[FRONTEND_ROWS_STORAGE_KEY]) ? local[FRONTEND_ROWS_STORAGE_KEY] : [];
+  return {
+    settings,
+    customers: Array.isArray(settings.customers) ? settings.customers : [],
+    savedQuotes: Array.isArray(settings.savedQuotes) ? settings.savedQuotes : [],
+    quotation,
+    rows,
+  };
+}
+
+async function getPreviousCloudSnapshot() {
+  if (!SUPABASE_ENABLED) return readJsonFile(LOCAL_BACKUP_FILE, null);
+  const rows = await dbSelect("app_settings", `select=setting_value&setting_key=eq.latest_local_backup_snapshot&limit=1`);
+  return Array.isArray(rows) && rows[0]?.setting_value ? rows[0].setting_value : null;
+}
+
+async function saveCloudSnapshot(snapshot, req) {
+  if (!SUPABASE_ENABLED) return;
+  const actor = actorFromRequest(req);
+  const row = {
+    setting_key: "latest_local_backup_snapshot",
+    setting_value: snapshot,
+    updated_by: actor.id,
+    updated_by_name: actor.name,
+    updated_at: new Date().toISOString(),
+  };
+  await dbUpsert("app_settings", [row], { onConflict: "setting_key", returning: false });
+}
+
+function toNumberOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function cleanDateOrNull(value) {
+  const text = String(value || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
+}
+
+async function upsertLeadsToSupabase(customers = [], req) {
+  if (!SUPABASE_ENABLED) return new Map();
+  const actor = actorFromRequest(req);
+  const valid = customers.filter((customer) => customer?.leadId || customer?.name || customer?.phone);
+  if (!valid.length) return new Map();
+  const rows = valid.map((c) => ({
+    lead_id: c.leadId || null,
+    date: cleanDateOrNull(c.date),
+    time: c.time || null,
+    day: c.day || null,
+    client_name: c.name || c.clientName || null,
+    phone: c.phone || null,
+    whatsapp: c.whatsapp || c.whatsappNumber || null,
+    location: c.location || null,
+    project_type: c.projectType || null,
+    product_inquired: c.productInquired || null,
+    source: c.source || null,
+    lead_type: c.leadType || null,
+    status: c.status || null,
+    next_follow_up_date: cleanDateOrNull(c.nextFollowUpDate),
+    quote_status: c.quoteStatus || c.lastQuoteStatus || null,
+    quotation_amount: toNumberOrNull(c.quotationAmount || c.quoteAmount || c.lastQuoteTotal),
+    meeting_scheduled: Boolean(c.meetingScheduled),
+    site_visit_done: Boolean(c.siteVisitDone),
+    deal_closed: Boolean(c.dealClosed),
+    closing_amount: toNumberOrNull(c.closingAmount),
+    lost_reason: c.lostReason || null,
+    notes: c.notes || c.NOTES || null,
+    updated_by: actor.id,
+    updated_at: new Date().toISOString(),
+  })).filter((row) => row.lead_id);
+  if (!rows.length) return new Map();
+  const saved = await dbUpsert("leads", rows, { onConflict: "lead_id" });
+  const map = new Map();
+  (Array.isArray(saved) ? saved : []).forEach((row) => {
+    if (row.lead_id) map.set(row.lead_id, row.id);
+  });
+  return map;
+}
+
+function normalizeQuoteDbPayload(quote = {}, leadUuid = null, actor = {}) {
+  const quotation = quote.quotation || {};
+  const quoteNumber = quote.quoteNo || quotation.referenceNo || quote.autoDraftNo || null;
+  return {
+    quote_number: quoteNumber,
+    lead_id: leadUuid || null,
+    client_name_snapshot: quote.customerName || quotation.customerName || quotation.customerDetails?.name || null,
+    client_phone_snapshot: quotation.customerDetails?.phone || quotation.phone || null,
+    client_location_snapshot: quotation.customerDetails?.location || quotation.location || null,
+    project_type_snapshot: quotation.customerDetails?.projectType || quotation.projectType || null,
+    status: quote.saveAsStatus || quote.quoteStatus || "draft",
+    quote_status: quote.quoteStatus || quotation.quoteStatus || null,
+    quotation_amount: toNumberOrNull(quote.finalTotal || quote.subtotal),
+    vat_amount: toNumberOrNull(quote.taxAmount),
+    discount_amount: toNumberOrNull(quote.discountAmount),
+    final_amount: toNumberOrNull(quote.finalTotal),
+    prepared_by: quotation.preparedBy || quote.preparedBy || null,
+    notes: quote.saveAsNote || quotation.saveAsNote || null,
+    project_scope: quotation.description || quote.projectScope || null,
+    quote_data: quote,
+    updated_by: actor.id,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function normalizeQuoteItemDbPayload(item = {}, quoteId, actor = {}) {
+  return {
+    quote_id: quoteId,
+    item_code: item.code || item.tag || item.itemCode || item.itemNo || null,
+    product: item.product || null,
+    category: item.category || item.type || null,
+    subcategory: item.subcategory || item.system || null,
+    width: toNumberOrNull(item.width || item.width_mm || item.widthMm),
+    height: toNumberOrNull(item.height || item.height_mm || item.heightMm),
+    qty: toNumberOrNull(item.qty || item.quantity) || 1,
+    area: toNumberOrNull(item.area || item.areaM2 || item.totalArea),
+    glass_type: item.glassType || item.glass_type || null,
+    glass_thickness: item.thickness || item.glassThickness || item.glass_thickness || null,
+    panel_spec: item.panelSpec || item.panel_spec || item.panelMode || null,
+    fixed_panels: toNumberOrNull(item.fixedPanels),
+    sliding_panels: toNumberOrNull(item.slidingPanels),
+    openable_panels: toNumberOrNull(item.openablePanels),
+    rows_count: toNumberOrNull(item.fixedRows || item.rows_count),
+    columns_count: toNumberOrNull(item.fixedColumns || item.columns_count),
+    pricing_mode: item.pricingMode || item.ruleType || null,
+    unit_price: toNumberOrNull(item.price || item.unitPrice || item.unit_price),
+    total_price: toNumberOrNull(item.total || item.totalPrice || item.lineTotal || item.finalTotal),
+    description: item.description || null,
+    warnings: item.warnings || null,
+    item_data: item,
+    updated_by: actor.id,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+async function nextQuoteVersionNumber(quoteId) {
+  const rows = await dbSelect("quote_versions", `select=version_number&quote_id=eq.${encodeEq(quoteId)}&order=version_number.desc&limit=1`);
+  const latest = Array.isArray(rows) && rows.length ? Number(rows[0].version_number) || 0 : 0;
+  return latest + 1;
+}
+
+async function upsertQuotesToSupabase(savedQuotes = [], leadMap = new Map(), req) {
+  if (!SUPABASE_ENABLED) return;
+  const actor = actorFromRequest(req);
+  for (const quote of savedQuotes) {
+    const quoteNumber = quote.quoteNo || quote.quotation?.referenceNo || quote.autoDraftNo;
+    if (!quoteNumber) continue;
+    const existingRows = await dbSelect("quotes", `select=id,quote_data&quote_number=eq.${encodeEq(quoteNumber)}&limit=1`);
+    const existingQuote = Array.isArray(existingRows) && existingRows.length ? existingRows[0] : null;
+    const quoteChanged = stableStringify(existingQuote?.quote_data || null) !== stableStringify(quote || null);
+
+    const leadUuid = quote.leadId && leadMap.has(quote.leadId) ? leadMap.get(quote.leadId) : null;
+    const quotePayload = normalizeQuoteDbPayload(quote, leadUuid, actor);
+    const saved = await dbUpsert("quotes", [quotePayload], { onConflict: "quote_number" });
+    const savedQuote = Array.isArray(saved) && saved.length ? saved[0] : null;
+    if (!savedQuote?.id) continue;
+
+    await dbDelete("quote_items", `quote_id=eq.${encodeEq(savedQuote.id)}`, { returning: false });
+    const items = Array.isArray(quote.rows) ? quote.rows : [];
+    if (items.length) {
+      await dbInsert("quote_items", items.map((item) => normalizeQuoteItemDbPayload(item, savedQuote.id, actor)), { returning: false });
+    }
+
+    if (quoteChanged) {
+      await dbInsert("quote_versions", [{
+        quote_id: savedQuote.id,
+        quote_number: quoteNumber,
+        version_number: await nextQuoteVersionNumber(savedQuote.id),
+        saved_by: actor.id,
+        saved_by_name: actor.name,
+        reason: existingQuote ? "quote_updated_from_staff_snapshot" : "quote_created_from_staff_snapshot",
+        quote_snapshot: quote,
+      }], { returning: false });
+    }
+  }
+}
+
+async function syncSnapshotBusinessData(snapshot = {}, req) {
+  if (!SUPABASE_ENABLED) return;
+  const state = extractAppStateFromSnapshot(snapshot);
+  const leadMap = await upsertLeadsToSupabase(state.customers, req);
+  await upsertQuotesToSupabase(state.savedQuotes, leadMap, req);
+}
+
+async function auditQuoteChanges(previousState, nextState, req) {
+  const oldQuotes = new Map((previousState.savedQuotes || []).map((q, i) => [quoteIdentity(q, i), q]));
+  const newQuotes = new Map((nextState.savedQuotes || []).map((q, i) => [quoteIdentity(q, i), q]));
+  const quoteFields = ["quoteNo", "customerName", "leadId", "quoteStatus", "saveAsStatus", "saveAsNote", "subtotal", "taxAmount", "finalTotal", "itemCount", "updatedAt"];
+  const itemFields = ["itemNo", "code", "tag", "product", "category", "type", "subcategory", "width", "height", "qty", "area", "glassType", "thickness", "panelMode", "panels", "fixedPanels", "slidingPanels", "openablePanels", "fixedRows", "fixedColumns", "pricingMode", "price", "unitPrice", "total", "totalPrice", "lineTotal"];
+
+  for (const [key, quote] of newQuotes.entries()) {
+    const previous = oldQuotes.get(key);
+    const quoteNumber = quote.quoteNo || quote.quotation?.referenceNo || quote.autoDraftNo || key;
+    if (!previous) {
+      await writeAuditLog(req, {
+        action_type: "quote_created",
+        module: "quotes",
+        target_table: "quotes",
+        target_id: quote.id || key,
+        quote_number: quoteNumber,
+        new_snapshot: quote,
+        change_summary: `${actorFromRequest(req).name} created/saved quote ${quoteNumber}.`,
+      });
+      continue;
+    }
+
+    for (const change of shallowFieldDiff(previous, quote, quoteFields)) {
+      await writeAuditLog(req, {
+        action_type: "quote_field_updated",
+        module: "quotes",
+        target_table: "quotes",
+        target_id: quote.id || key,
+        quote_number: quoteNumber,
+        field_name: change.field,
+        old_value: change.oldValue,
+        new_value: change.newValue,
+        old_snapshot: previous,
+        new_snapshot: quote,
+        change_summary: `${actorFromRequest(req).name} changed ${change.field} on quote ${quoteNumber} from ${valueToAuditText(change.oldValue) || "blank"} to ${valueToAuditText(change.newValue) || "blank"}.`,
+      });
+    }
+
+    const oldItems = new Map((previous.rows || []).map((row, i) => [rowIdentity(row, i), row]));
+    const newItems = new Map((quote.rows || []).map((row, i) => [rowIdentity(row, i), row]));
+    for (const [itemKey, item] of newItems.entries()) {
+      const oldItem = oldItems.get(itemKey);
+      const itemCode = item.code || item.tag || item.itemNo || itemKey;
+      if (!oldItem) {
+        await writeAuditLog(req, {
+          action_type: "quote_item_added",
+          module: "quote_items",
+          target_table: "quote_items",
+          target_id: item.id || itemKey,
+          quote_number: quoteNumber,
+          item_code: itemCode,
+          item_product: item.subcategory || item.product || null,
+          new_snapshot: item,
+          change_summary: `${actorFromRequest(req).name} added item ${itemCode} to quote ${quoteNumber}.`,
+        });
+        continue;
+      }
+      for (const change of shallowFieldDiff(oldItem, item, itemFields)) {
+        await writeAuditLog(req, {
+          action_type: "quote_item_field_updated",
+          module: "quote_items",
+          target_table: "quote_items",
+          target_id: item.id || itemKey,
+          quote_number: quoteNumber,
+          item_code: itemCode,
+          item_product: item.subcategory || item.product || null,
+          field_name: change.field,
+          old_value: change.oldValue,
+          new_value: change.newValue,
+          old_snapshot: oldItem,
+          new_snapshot: item,
+          change_summary: `${actorFromRequest(req).name} changed ${change.field} for item ${itemCode} in quote ${quoteNumber} from ${valueToAuditText(change.oldValue) || "blank"} to ${valueToAuditText(change.newValue) || "blank"}.`,
+        });
+      }
+    }
+    for (const [itemKey, oldItem] of oldItems.entries()) {
+      if (newItems.has(itemKey)) continue;
+      const itemCode = oldItem.code || oldItem.tag || oldItem.itemNo || itemKey;
+      await writeAuditLog(req, {
+        action_type: "quote_item_removed",
+        module: "quote_items",
+        target_table: "quote_items",
+        target_id: oldItem.id || itemKey,
+        quote_number: quoteNumber,
+        item_code: itemCode,
+        item_product: oldItem.subcategory || oldItem.product || null,
+        old_snapshot: oldItem,
+        change_summary: `${actorFromRequest(req).name} removed item ${itemCode} from quote ${quoteNumber}.`,
+      });
+    }
+  }
+
+  for (const [key, oldQuote] of oldQuotes.entries()) {
+    if (newQuotes.has(key)) continue;
+    const quoteNumber = oldQuote.quoteNo || oldQuote.quotation?.referenceNo || oldQuote.autoDraftNo || key;
+    await writeAuditLog(req, {
+      action_type: "quote_removed",
+      module: "quotes",
+      target_table: "quotes",
+      target_id: oldQuote.id || key,
+      quote_number: quoteNumber,
+      old_snapshot: oldQuote,
+      change_summary: `${actorFromRequest(req).name} removed quote ${quoteNumber}.`,
+    });
+  }
+}
+
+async function auditLeadChanges(previousState, nextState, req) {
+  const oldLeads = new Map((previousState.customers || []).map((lead, i) => [leadIdentity(lead, i), lead]));
+  const newLeads = new Map((nextState.customers || []).map((lead, i) => [leadIdentity(lead, i), lead]));
+  const leadFields = ["leadId", "name", "phone", "whatsapp", "location", "projectType", "productInquired", "source", "leadType", "status", "nextFollowUpDate", "quoteStatus", "quotationAmount", "meetingScheduled", "siteVisitDone", "dealClosed", "closingAmount", "lostReason", "notes", "lastQuoteNo", "lastQuoteStatus", "lastQuoteTotal"];
+  for (const [key, lead] of newLeads.entries()) {
+    const previous = oldLeads.get(key);
+    const leadLabel = lead.leadId || lead.name || key;
+    if (!previous) {
+      await writeAuditLog(req, {
+        action_type: "lead_created",
+        module: "crm",
+        target_table: "leads",
+        target_id: lead.id || lead.leadId || key,
+        new_snapshot: lead,
+        change_summary: `${actorFromRequest(req).name} created/added lead ${leadLabel}.`,
+      });
+      continue;
+    }
+    for (const change of shallowFieldDiff(previous, lead, leadFields)) {
+      await writeAuditLog(req, {
+        action_type: "lead_field_updated",
+        module: "crm",
+        target_table: "leads",
+        target_id: lead.id || lead.leadId || key,
+        field_name: change.field,
+        old_value: change.oldValue,
+        new_value: change.newValue,
+        old_snapshot: previous,
+        new_snapshot: lead,
+        change_summary: `${actorFromRequest(req).name} changed ${change.field} for lead ${leadLabel} from ${valueToAuditText(change.oldValue) || "blank"} to ${valueToAuditText(change.newValue) || "blank"}.`,
+      });
+    }
+  }
+}
+
+async function auditCurrentRowsChanges(previousState, nextState, req) {
+  const quoteNumber = nextState.quotation?.referenceNo || nextState.quotation?.autoDraftNo || previousState.quotation?.referenceNo || previousState.quotation?.autoDraftNo || "current draft";
+  const oldRows = new Map((previousState.rows || []).map((row, i) => [rowIdentity(row, i), row]));
+  const newRows = new Map((nextState.rows || []).map((row, i) => [rowIdentity(row, i), row]));
+  const itemFields = ["itemNo", "code", "tag", "product", "category", "type", "subcategory", "width", "height", "qty", "area", "glassType", "thickness", "panelMode", "panels", "fixedPanels", "slidingPanels", "openablePanels", "fixedRows", "fixedColumns", "pricingMode", "price", "unitPrice", "total", "totalPrice", "lineTotal"];
+  for (const [key, row] of newRows.entries()) {
+    const previous = oldRows.get(key);
+    if (!previous) continue;
+    for (const change of shallowFieldDiff(previous, row, itemFields)) {
+      await writeAuditLog(req, {
+        action_type: "current_quote_item_field_updated",
+        module: "current_quote",
+        target_table: "quote_items",
+        target_id: row.id || key,
+        quote_number: quoteNumber,
+        item_code: row.code || row.tag || row.itemNo || key,
+        item_product: row.subcategory || row.product || null,
+        field_name: change.field,
+        old_value: change.oldValue,
+        new_value: change.newValue,
+        old_snapshot: previous,
+        new_snapshot: row,
+        change_summary: `${actorFromRequest(req).name} changed ${change.field} for current quote item ${row.code || row.tag || row.itemNo || key} from ${valueToAuditText(change.oldValue) || "blank"} to ${valueToAuditText(change.newValue) || "blank"}.`,
+      });
+    }
+  }
+}
+
+async function auditSnapshotChanges(previousSnapshot, nextSnapshot, req) {
+  if (!previousSnapshot) {
+    await writeAuditLog(req, {
+      action_type: "initial_cloud_snapshot",
+      module: "backup",
+      target_table: "app_settings",
+      target_id: "latest_local_backup_snapshot",
+      new_snapshot: { summary: nextSnapshot?.summary || null, savedAt: nextSnapshot?.savedAt || null },
+      change_summary: `${actorFromRequest(req).name} created the first cloud app snapshot.`,
+    });
+    return;
+  }
+
+  const previousState = extractAppStateFromSnapshot(previousSnapshot);
+  const nextState = extractAppStateFromSnapshot(nextSnapshot);
+  await auditQuoteChanges(previousState, nextState, req);
+  await auditLeadChanges(previousState, nextState, req);
+  await auditCurrentRowsChanges(previousState, nextState, req);
+}
+
 function cleanStaffSessions() {
   const now = Date.now();
   for (const [token, session] of staffSessions.entries()) {
@@ -704,16 +1375,21 @@ app.get("/staff-session", requireStaff, (req, res) => {
   });
 });
 
-app.get("/staff-users", requireStaff, (req, res) => {
-  res.json({ success: true, ok: true, users: getStaffProfiles() });
+app.get("/staff-users", requireStaff, async (req, res) => {
+  try {
+    res.json({ success: true, ok: true, users: await getStaffProfiles() });
+  } catch (error) {
+    console.error("Staff users load error:", error);
+    res.status(500).json({ success: false, ok: false, error: error.message || "Could not load staff users." });
+  }
 });
 
-app.post("/staff-users/login", requireStaff, (req, res) => {
+app.post("/staff-users/login", requireStaff, async (req, res) => {
   const name = normalizeStaffProfileName(req.body?.name);
   const password = String(req.body?.password || "");
-  const profile = findStoredStaffProfile(name);
+  const profile = await findStaffProfileRecord(name);
 
-  if (!profile || !profile.passwordHash) {
+  if (!profile || !(profile.passwordHash || profile.password_hash)) {
     return res.status(404).json({ success: false, ok: false, error: "This staff user does not have a password yet. Create the password first." });
   }
 
@@ -722,17 +1398,20 @@ app.post("/staff-users/login", requireStaff, (req, res) => {
   }
 
   const user = publicStaffProfile(profile, { includePermissions: true });
+  if (SUPABASE_ENABLED && profile?.id) {
+    await dbPatch("staff_users", `id=eq.${encodeEq(profile.id)}`, { last_login_at: new Date().toISOString() }, { returning: false });
+  }
   setActiveProfileForRequest(req, { ...profile, name: user.name });
   res.json({ success: true, ok: true, user });
 });
 
-app.post("/staff-users", requireStaff, (req, res) => {
+app.post("/staff-users", requireStaff, async (req, res) => {
   try {
     const name = normalizeStaffProfileName(req.body?.name);
     const password = String(req.body?.password || "");
-    const existingProfile = findStoredStaffProfile(name);
+    const existingProfile = await findStaffProfileRecord(name);
     const isDefaultUser = isDefaultStaffProfileName(name);
-    const isKnownDefaultWithoutPassword = isDefaultUser && !existingProfile?.passwordHash;
+    const isKnownDefaultWithoutPassword = isDefaultUser && !(existingProfile?.passwordHash || existingProfile?.password_hash);
     const isNewSelfSignup = !existingProfile && !isDefaultUser;
     const isPrivileged = activeStaffIsOwner(req);
 
@@ -748,46 +1427,88 @@ app.post("/staff-users", requireStaff, (req, res) => {
       }
     }
 
-    if (isOwnerStaffProfileName(name) && existingProfile?.passwordHash && !isPrivileged) {
+    if (isOwnerStaffProfileName(name) && (existingProfile?.passwordHash || existingProfile?.password_hash) && !isPrivileged) {
       return res.status(403).json({ success: false, ok: false, error: "You do not have permission to edit this staff user." });
     }
 
     const requestedRole = isPrivileged ? (req.body?.role || existingProfile?.role || "staff") : "staff";
-    const user = createOrUpdateStaffProfile({
+    const user = await createOrUpdateStaffProfile({
       name,
       password,
       role: requestedRole,
-      requirePassword: Boolean(!existingProfile?.passwordHash && password),
+      requirePassword: Boolean(!existingProfile?.passwordHash && !existingProfile?.password_hash && password),
+      actor: getActiveStaffProfile(req),
     });
 
-    const userWithPermissions = publicStaffProfile({ ...user, name }, { includePermissions: true });
+    const userWithPermissions = user;
     if (isNewSelfSignup || isKnownDefaultWithoutPassword) setActiveProfileForRequest(req, { ...user, name });
-    res.json({ success: true, ok: true, user: userWithPermissions, users: getStaffProfiles() });
+    await writeAuditLog(req, {
+      action_type: existingProfile ? "staff_user_updated" : "staff_user_created",
+      module: "user_management",
+      target_table: "staff_users",
+      target_id: user.id,
+      new_snapshot: { id: user.id, name: user.name, role: user.role },
+      change_summary: `${getActiveStaffProfile(req)?.name || "Staff"} ${existingProfile ? "updated" : "created"} staff profile ${user.name}.`,
+    });
+    res.json({ success: true, ok: true, user: userWithPermissions, users: await getStaffProfiles() });
   } catch (error) {
     res.status(400).json({ success: false, ok: false, error: error.message || "Could not save staff user." });
   }
 });
 
-app.delete("/staff-users/:id", requireStaff, (req, res) => {
-  if (!activeStaffIsOwner(req)) {
-    return res.status(403).json({ success: false, ok: false, error: "You do not have permission to remove staff users." });
+app.delete("/staff-users/:id", requireStaff, async (req, res) => {
+  try {
+    if (!activeStaffIsOwner(req)) {
+      return res.status(403).json({ success: false, ok: false, error: "You do not have permission to remove staff users." });
+    }
+
+    const id = String(req.params.id || "").trim();
+
+    if (SUPABASE_ENABLED) {
+      const rows = await dbSelect("staff_users", `select=*&id=eq.${encodeEq(id)}&limit=1`);
+      const target = Array.isArray(rows) && rows.length ? rows[0] : null;
+      if (!target) return res.status(404).json({ success: false, ok: false, error: "Staff user not found." });
+      if (target.is_protected || isOwnerStaffProfileName(target.display_name)) {
+        return res.status(403).json({ success: false, ok: false, error: "This profile cannot be removed." });
+      }
+      await dbPatch("staff_users", `id=eq.${encodeEq(id)}`, { status: "inactive", updated_at: new Date().toISOString(), updated_by: isUuid(getActiveStaffProfile(req)?.id) ? getActiveStaffProfile(req).id : null }, { returning: false });
+      await writeAuditLog(req, {
+        action_type: "staff_user_removed",
+        module: "user_management",
+        target_table: "staff_users",
+        target_id: target.id,
+        old_snapshot: target,
+        change_summary: `${getActiveStaffProfile(req)?.name || "Staff"} removed staff profile ${target.display_name}.`,
+      });
+      return res.json({ success: true, ok: true, users: await getStaffProfiles() });
+    }
+
+    const profiles = readStoredStaffProfiles();
+    const target = profiles.find((profile) => String(profile?.id || "") === id || staffProfileIdFromName(profile?.name || "") === id);
+
+    if (!target) {
+      return res.status(404).json({ success: false, ok: false, error: "Staff user not found." });
+    }
+
+    if (isOwnerStaffProfileName(target.name)) {
+      return res.status(403).json({ success: false, ok: false, error: "This profile cannot be removed." });
+    }
+
+    const nextProfiles = profiles.filter((profile) => profile !== target);
+    saveStoredStaffProfiles(nextProfiles);
+    await writeAuditLog(req, {
+      action_type: "staff_user_removed",
+      module: "user_management",
+      target_table: "staff_users",
+      target_id: target.id,
+      old_snapshot: target,
+      change_summary: `${getActiveStaffProfile(req)?.name || "Staff"} removed staff profile ${target.name}.`,
+    });
+    res.json({ success: true, ok: true, users: await getStaffProfiles() });
+  } catch (error) {
+    console.error("Remove staff user error:", error);
+    res.status(500).json({ success: false, ok: false, error: error.message || "Could not remove staff user." });
   }
-
-  const id = String(req.params.id || "").trim();
-  const profiles = readStoredStaffProfiles();
-  const target = profiles.find((profile) => String(profile?.id || "") === id || staffProfileIdFromName(profile?.name || "") === id);
-
-  if (!target) {
-    return res.status(404).json({ success: false, ok: false, error: "Staff user not found." });
-  }
-
-  if (isOwnerStaffProfileName(target.name)) {
-    return res.status(403).json({ success: false, ok: false, error: "This profile cannot be removed." });
-  }
-
-  const nextProfiles = profiles.filter((profile) => profile !== target);
-  saveStoredStaffProfiles(nextProfiles);
-  res.json({ success: true, ok: true, users: getStaffProfiles() });
 });
 
 app.get("/health", (req, res) => {
@@ -797,7 +1518,42 @@ app.get("/health", (req, res) => {
     model: MODEL,
     webSearchEnabled: ENABLE_WEB_SEARCH,
     webSearchModel: WEB_SEARCH_MODEL,
+    databaseEnabled: SUPABASE_ENABLED,
+    storage: SUPABASE_ENABLED ? "supabase" : "local-file-fallback",
   });
+});
+
+app.get("/db-health", requireStaff, async (req, res) => {
+  if (!SUPABASE_ENABLED) {
+    return res.status(500).json({ ok: false, success: false, databaseEnabled: false, error: "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are not configured." });
+  }
+  try {
+    const auditSample = await dbSelect("audit_logs", "select=id&limit=1");
+    const userSample = await dbSelect("staff_users", "select=id&limit=1");
+    res.json({
+      ok: true,
+      success: true,
+      databaseEnabled: true,
+      checkedTables: { audit_logs: Array.isArray(auditSample), staff_users: Array.isArray(userSample) },
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, success: false, databaseEnabled: true, error: error.message || "Database check failed." });
+  }
+});
+
+app.get("/audit-logs", requireStaff, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 300);
+  if (!SUPABASE_ENABLED) {
+    const file = path.join(DATA_DIR, "audit-log.json");
+    const rows = readJsonFile(file, []);
+    return res.json({ ok: true, success: true, logs: rows.slice(-limit).reverse(), storage: "local-file" });
+  }
+  try {
+    const rows = await dbSelect("audit_logs", `select=*&order=created_at.desc&limit=${limit}`);
+    res.json({ ok: true, success: true, logs: Array.isArray(rows) ? rows : [], storage: "supabase" });
+  } catch (error) {
+    res.status(500).json({ ok: false, success: false, error: error.message || "Could not load audit logs." });
+  }
 });
 
 app.get("/local-backup", requireStaff, (req, res) => {
@@ -812,7 +1568,7 @@ app.get("/local-backup/download", requireStaff, (req, res) => {
   res.download(LOCAL_BACKUP_FILE, "estimation-grid-app-data.json");
 });
 
-app.post("/local-backup", requireStaff, (req, res) => {
+app.post("/local-backup", requireStaff, async (req, res) => {
   const payload = req.body || {};
   const headerUserName = String(req.headers["x-staff-user"] || "").trim();
   const headerUserId = String(req.headers["x-staff-user-id"] || "").trim();
@@ -821,8 +1577,39 @@ app.post("/local-backup", requireStaff, (req, res) => {
     actor: req.staff?.activeUser || (headerUserName ? { id: headerUserId || staffProfileIdFromName(headerUserName), name: headerUserName } : null),
     backendSavedAt: new Date().toISOString(),
   };
-  writeJsonFile(LOCAL_BACKUP_FILE, snapshot);
-  res.json({ ok: true, success: true, file: LOCAL_BACKUP_FILE, savedAt: snapshot.backendSavedAt });
+
+  try {
+    const previousSnapshot = await getPreviousCloudSnapshot();
+    writeJsonFile(LOCAL_BACKUP_FILE, snapshot);
+
+    if (SUPABASE_ENABLED) {
+      const previousHash = previousSnapshot ? crypto.createHash("sha256").update(JSON.stringify(previousSnapshot)).digest("hex") : "";
+      const nextHash = crypto.createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+      if (previousHash !== nextHash) {
+        await auditSnapshotChanges(previousSnapshot, snapshot, req);
+      }
+      await saveCloudSnapshot(snapshot, req);
+      await syncSnapshotBusinessData(snapshot, req);
+    }
+
+    res.json({
+      ok: true,
+      success: true,
+      storage: SUPABASE_ENABLED ? "supabase+local-file" : "local-file",
+      file: LOCAL_BACKUP_FILE,
+      savedAt: snapshot.backendSavedAt,
+    });
+  } catch (error) {
+    console.error("Local backup/Supabase sync failed:", error);
+    writeJsonFile(LOCAL_BACKUP_FILE, snapshot);
+    res.status(500).json({
+      ok: false,
+      success: false,
+      error: error.message || "Could not save app data to Supabase.",
+      fileBackupSaved: true,
+      savedAt: snapshot.backendSavedAt,
+    });
+  }
 });
 
 app.get("/agent-requests", requireStaff, (req, res) => {
