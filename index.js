@@ -27,6 +27,7 @@ const DATA_DIR = path.join(__dirname, "data");
 const LOCAL_BACKUP_FILE = path.join(DATA_DIR, "app-data.json");
 const STAFF_PROFILE_USERS_FILE = path.join(DATA_DIR, "staff-users.json");
 const DEFAULT_STAFF_PROFILE_NAMES = ["Sameer", "Sajid", "Rasheed", "Jithin", "Arafat"];
+const STAFF_OWNER_PROFILE_NAME = normalizeStaffProfileName(process.env.STAFF_OWNER_PROFILE_NAME || "Sameer");
 
 const allowedOrigins = (process.env.CORS_ORIGINS || "https://buildupuae.com,https://www.buildupuae.com,https://auto-quote-backend.onrender.com")
   .split(",")
@@ -67,7 +68,7 @@ function normalizeStaffProfileName(value = "") {
   return String(value || "")
     .trim()
     .replace(/\s+/g, " ")
-    .replace(/\w/g, (char) => char.toUpperCase());
+    .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
 function staffProfileIdFromName(name = "") {
@@ -76,6 +77,37 @@ function staffProfileIdFromName(name = "") {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "") || `user-${Date.now().toString(36)}`;
+}
+
+function isOwnerStaffProfileName(name = "") {
+  return normalizeStaffProfileName(name).toLowerCase() === STAFF_OWNER_PROFILE_NAME.toLowerCase();
+}
+
+function isDefaultStaffProfileName(name = "") {
+  const cleanName = normalizeStaffProfileName(name);
+  return DEFAULT_STAFF_PROFILE_NAMES.some((item) => item.toLowerCase() === cleanName.toLowerCase());
+}
+
+function normalizeStaffProfileRole(role = "staff", name = "") {
+  if (isOwnerStaffProfileName(name)) return "owner";
+  const cleanRole = String(role || "staff").trim().toLowerCase();
+  return ["admin", "staff"].includes(cleanRole) ? cleanRole : "staff";
+}
+
+function publicStaffProfile(profile = {}) {
+  const cleanName = normalizeStaffProfileName(profile?.name);
+  const role = normalizeStaffProfileRole(profile?.role, cleanName);
+  return {
+    id: profile.id || staffProfileIdFromName(cleanName),
+    name: cleanName,
+    role,
+    owner: role === "owner",
+    protected: role === "owner",
+    defaultUser: isDefaultStaffProfileName(cleanName),
+    hasPassword: Boolean(profile.passwordHash && profile.salt),
+    createdAt: profile.createdAt || null,
+    updatedAt: profile.updatedAt || null,
+  };
 }
 
 function hashStaffProfilePassword(password = "") {
@@ -109,28 +141,22 @@ function getStaffProfiles() {
 
   DEFAULT_STAFF_PROFILE_NAMES.forEach((name) => {
     const cleanName = normalizeStaffProfileName(name);
-    byName.set(cleanName.toLowerCase(), {
+    byName.set(cleanName.toLowerCase(), publicStaffProfile({
       id: staffProfileIdFromName(cleanName),
       name: cleanName,
-      defaultUser: true,
-      hasPassword: false,
-    });
+      role: normalizeStaffProfileRole("staff", cleanName),
+    }));
   });
 
   stored.forEach((profile) => {
     const cleanName = normalizeStaffProfileName(profile?.name);
     if (!cleanName) return;
-    byName.set(cleanName.toLowerCase(), {
-      id: profile.id || staffProfileIdFromName(cleanName),
-      name: cleanName,
-      defaultUser: DEFAULT_STAFF_PROFILE_NAMES.some((item) => item.toLowerCase() === cleanName.toLowerCase()),
-      hasPassword: Boolean(profile.passwordHash && profile.salt),
-      createdAt: profile.createdAt || null,
-      updatedAt: profile.updatedAt || null,
-    });
+    byName.set(cleanName.toLowerCase(), publicStaffProfile(profile));
   });
 
   return Array.from(byName.values()).sort((a, b) => {
+    if (a.owner && !b.owner) return -1;
+    if (!a.owner && b.owner) return 1;
     const ai = DEFAULT_STAFF_PROFILE_NAMES.findIndex((name) => name.toLowerCase() === a.name.toLowerCase());
     const bi = DEFAULT_STAFF_PROFILE_NAMES.findIndex((name) => name.toLowerCase() === b.name.toLowerCase());
     if (ai >= 0 || bi >= 0) return (ai >= 0 ? ai : 999) - (bi >= 0 ? bi : 999);
@@ -144,38 +170,62 @@ function findStoredStaffProfile(name = "") {
   return readStoredStaffProfiles().find((profile) => String(profile?.name || "").trim().toLowerCase() === cleanName.toLowerCase()) || null;
 }
 
-function createOrUpdateStaffProfile({ name, password }) {
+function createOrUpdateStaffProfile({ name, password, role = "staff", requirePassword = true }) {
   const cleanName = normalizeStaffProfileName(name);
   const cleanPassword = String(password || "");
   if (!cleanName) throw new Error("Staff user name is required.");
-  if (cleanPassword.length < 4) throw new Error("Staff user password must be at least 4 characters.");
+  if (requirePassword && cleanPassword.length < 4) throw new Error("Staff user password must be at least 4 characters.");
+  if (cleanPassword && cleanPassword.length < 4) throw new Error("Staff user password must be at least 4 characters.");
 
   const profiles = readStoredStaffProfiles();
   const now = new Date().toISOString();
   const existingIndex = profiles.findIndex((profile) => String(profile?.name || "").trim().toLowerCase() === cleanName.toLowerCase());
-  const { salt, hash } = hashStaffProfilePassword(cleanPassword);
+  const existing = existingIndex >= 0 ? profiles[existingIndex] : {};
   const nextProfile = {
-    id: existingIndex >= 0 ? (profiles[existingIndex].id || staffProfileIdFromName(cleanName)) : `${staffProfileIdFromName(cleanName)}-${Date.now().toString(36)}`,
+    id: existingIndex >= 0 ? (existing.id || staffProfileIdFromName(cleanName)) : `${staffProfileIdFromName(cleanName)}-${Date.now().toString(36)}`,
     name: cleanName,
-    passwordHash: hash,
-    salt,
-    createdAt: existingIndex >= 0 ? profiles[existingIndex].createdAt || now : now,
+    role: normalizeStaffProfileRole(role || existing.role || "staff", cleanName),
+    createdAt: existingIndex >= 0 ? existing.createdAt || now : now,
     updatedAt: now,
   };
+
+  if (cleanPassword) {
+    const { salt, hash } = hashStaffProfilePassword(cleanPassword);
+    nextProfile.passwordHash = hash;
+    nextProfile.salt = salt;
+  } else if (existing?.passwordHash && existing?.salt) {
+    nextProfile.passwordHash = existing.passwordHash;
+    nextProfile.salt = existing.salt;
+  }
 
   if (existingIndex >= 0) profiles[existingIndex] = nextProfile;
   else profiles.push(nextProfile);
   saveStoredStaffProfiles(profiles);
-  return { id: nextProfile.id, name: nextProfile.name };
+  return publicStaffProfile(nextProfile);
 }
 
 function setActiveProfileForRequest(req, user) {
   const token = getStaffToken(req);
   const session = token ? staffSessions.get(token) : null;
   if (session && user?.name) {
-    session.activeUser = { id: user.id || staffProfileIdFromName(user.name), name: user.name };
+    const publicProfile = publicStaffProfile(user);
+    session.activeUser = {
+      id: publicProfile.id,
+      name: publicProfile.name,
+      role: publicProfile.role,
+      owner: publicProfile.owner,
+    };
     staffSessions.set(token, session);
   }
+}
+
+function getActiveStaffProfile(req) {
+  return req?.staff?.activeUser || null;
+}
+
+function activeStaffIsOwner(req) {
+  const active = getActiveStaffProfile(req);
+  return Boolean(active?.owner || active?.role === "owner" || isOwnerStaffProfileName(active?.name));
 }
 
 function getConfiguredStaffUsers() {
@@ -193,7 +243,7 @@ function getConfiguredStaffUsers() {
               email,
               password,
               name: String(user?.name || email).trim(),
-              role: String(user?.role || "staff").trim() || "staff",
+              role: normalizeStaffProfileRole(user?.role || "staff", user?.name || email),
             });
           }
         });
@@ -204,7 +254,7 @@ function getConfiguredStaffUsers() {
   }
 
   if (STAFF_EMAIL && STAFF_PASSWORD) {
-    users.push({ email: STAFF_EMAIL, password: STAFF_PASSWORD, name: STAFF_EMAIL, role: "staff" });
+    users.push({ email: STAFF_EMAIL, password: STAFF_PASSWORD, name: STAFF_EMAIL, role: normalizeStaffProfileRole("staff", STAFF_EMAIL) });
   }
 
   return users;
@@ -666,19 +716,61 @@ app.post("/staff-users/login", requireStaff, (req, res) => {
     return res.status(401).json({ success: false, ok: false, error: "Incorrect user password." });
   }
 
-  const user = { id: profile.id || staffProfileIdFromName(profile.name), name: profile.name };
+  const user = publicStaffProfile(profile);
   setActiveProfileForRequest(req, user);
   res.json({ success: true, ok: true, user });
 });
 
 app.post("/staff-users", requireStaff, (req, res) => {
   try {
-    const user = createOrUpdateStaffProfile({ name: req.body?.name, password: req.body?.password });
-    setActiveProfileForRequest(req, user);
+    const name = normalizeStaffProfileName(req.body?.name);
+    const password = String(req.body?.password || "");
+    const existingProfile = findStoredStaffProfile(name);
+    const isDefaultUser = isDefaultStaffProfileName(name);
+    const isFirstPasswordSetup = isDefaultUser && !existingProfile?.passwordHash && password;
+
+    if (!isFirstPasswordSetup && !activeStaffIsOwner(req)) {
+      return res.status(403).json({ success: false, ok: false, error: "Only the owner can add or edit staff users." });
+    }
+
+    if (isOwnerStaffProfileName(name) && existingProfile?.passwordHash && !activeStaffIsOwner(req)) {
+      return res.status(403).json({ success: false, ok: false, error: "Only the owner can edit the owner profile." });
+    }
+
+    const user = createOrUpdateStaffProfile({
+      name,
+      password,
+      role: req.body?.role || existingProfile?.role || "staff",
+      requirePassword: Boolean(isFirstPasswordSetup),
+    });
+
+    if (isFirstPasswordSetup) setActiveProfileForRequest(req, user);
     res.json({ success: true, ok: true, user, users: getStaffProfiles() });
   } catch (error) {
-    res.status(400).json({ success: false, ok: false, error: error.message || "Could not create staff user." });
+    res.status(400).json({ success: false, ok: false, error: error.message || "Could not save staff user." });
   }
+});
+
+app.delete("/staff-users/:id", requireStaff, (req, res) => {
+  if (!activeStaffIsOwner(req)) {
+    return res.status(403).json({ success: false, ok: false, error: "Only the owner can remove staff users." });
+  }
+
+  const id = String(req.params.id || "").trim();
+  const profiles = readStoredStaffProfiles();
+  const target = profiles.find((profile) => String(profile?.id || "") === id || staffProfileIdFromName(profile?.name || "") === id);
+
+  if (!target) {
+    return res.status(404).json({ success: false, ok: false, error: "Staff user not found." });
+  }
+
+  if (isOwnerStaffProfileName(target.name)) {
+    return res.status(403).json({ success: false, ok: false, error: "The owner profile cannot be removed." });
+  }
+
+  const nextProfiles = profiles.filter((profile) => profile !== target);
+  saveStoredStaffProfiles(nextProfiles);
+  res.json({ success: true, ok: true, users: getStaffProfiles() });
 });
 
 app.get("/health", (req, res) => {
