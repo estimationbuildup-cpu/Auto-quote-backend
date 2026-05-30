@@ -944,17 +944,32 @@ function buildUserPayload({ mode, prompt, messages, catalog, customer }) {
   );
 }
 
+function supportsCustomTemperature(modelName = "") {
+  const normalized = String(modelName || "").trim().toLowerCase();
+
+  // GPT-5.5 / GPT-5 family models only support the default temperature value.
+  // Do not send a custom temperature parameter for these models.
+  if (normalized.startsWith("gpt-5")) return false;
+
+  return true;
+}
+
 async function runChatCompletion({ mode, prompt, messages, catalog, customer }) {
   const userContent = buildUserPayload({ mode, prompt, messages, catalog, customer });
-  const response = await client.chat.completions.create({
+  const requestPayload = {
     model: MODEL,
     response_format: { type: "json_object" },
     messages: [
       { role: "system", content: buildSystemPrompt(mode) },
       { role: "user", content: userContent },
     ],
-    temperature: mode === "customer" ? 0.35 : 0.2,
-  });
+  };
+
+  if (supportsCustomTemperature(MODEL)) {
+    requestPayload.temperature = mode === "customer" ? 0.35 : 0.2;
+  }
+
+  const response = await client.chat.completions.create(requestPayload);
   const content = response.choices?.[0]?.message?.content || "{}";
   return { parsed: safeParseJson(content), usage: response.usage || null, usedWeb: false };
 }
