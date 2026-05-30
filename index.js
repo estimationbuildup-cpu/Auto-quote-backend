@@ -1351,17 +1351,32 @@ function normalizeCustomerRequestRecord(payload = {}) {
   };
 }
 
-function customerConversationMessageKey(message = {}) {
-  // Do not include timestamp/id in the key. The duplicate bug created the same visible
-  // message with different timestamps and different sender labels (user/customer).
-  const role = normalizeRole(message.role);
+function makeServerMessageId(prefix = "msg") {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function normalizeConversationSender(message = {}, role = normalizeRole(message.role)) {
   const rawSender = String(message.sender || "").trim().toLowerCase();
-  const sender = role === "user" ? "customer" : rawSender === "staff" ? "staff" : "assistant";
-  return [
+  if (role === "user") return "customer";
+  if (rawSender === "staff" || message.kind === "staff-reply") return "staff";
+  return "assistant";
+}
+
+function normalizeConversationMessage(message = {}, index = 0) {
+  const text = String(message?.content || message?.text || "").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  const role = normalizeRole(message.role);
+  const sender = normalizeConversationSender(message, role);
+  return {
+    ...message,
+    id: String(message.id || message.messageId || message.clientMessageId || makeServerMessageId(`legacy_${index}`)),
     role,
     sender,
-    String(message.content || message.text || "").replace(/\s+/g, " ").trim().toLowerCase(),
-  ].join("|");
+    content: text,
+    text,
+    at: message.at || message.created_at || new Date().toISOString(),
+    staffName: message.staffName || null,
+  };
 }
 
 function mergeCustomerConversations(previousConversation = [], incomingConversation = []) {
@@ -1369,19 +1384,23 @@ function mergeCustomerConversations(previousConversation = [], incomingConversat
     ...(Array.isArray(previousConversation) ? previousConversation : []),
     ...(Array.isArray(incomingConversation) ? incomingConversation : []),
   ];
-  const seen = new Set();
+  const seenIds = new Set();
   const merged = [];
+  let welcomeKept = false;
 
-  for (const message of combined) {
-    const text = String(message?.content || message?.text || "").replace(/\s+/g, " ").trim();
-    if (!text) continue;
-    const key = customerConversationMessageKey({ ...message, content: text, text });
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const role = normalizeRole(message.role);
-    const rawSender = String(message.sender || "").trim().toLowerCase();
-    const sender = role === "user" ? "customer" : rawSender === "staff" ? "staff" : "assistant";
-    merged.push({ ...message, role, sender, content: message.content ?? text, text: message.text ?? text });
+  for (let index = 0; index < combined.length; index += 1) {
+    const message = normalizeConversationMessage(combined[index], index);
+    if (!message) continue;
+
+    // Only collapse the repeated system welcome. Do not dedupe customer text.
+    if (message.sender === "assistant" && message.content === "Hi! Tell me what aluminium/glass work you need. You can mention product, sizes, quantity, location, glass type, colour, or upload details later. I will ask for anything missing.") {
+      if (welcomeKept) continue;
+      welcomeKept = true;
+    }
+
+    if (message.id && seenIds.has(message.id)) continue;
+    if (message.id) seenIds.add(message.id);
+    merged.push(message);
   }
 
   return merged.sort((a, b) => {
@@ -2245,6 +2264,7 @@ app.post("/customer-chat-message", async (req, res) => {
     const previous = dedupeCustomerRequests(rows).find((row) => String(row?.estimate_data?.chatId || row?.id || "") === String(chatId) || String(row?.id || "") === String(chatId));
     const previousConversation = Array.isArray(previous?.conversation) ? previous.conversation : [];
     const nextMessage = {
+      id: String(body.messageId || body.clientMessageId || makeServerMessageId(sender === "staff" ? "staff_msg" : "customer_msg")),
       role: sender === "staff" ? "assistant" : "user",
       sender,
       content: text,
