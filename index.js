@@ -1341,8 +1341,65 @@ function normalizeCustomerRequestRecord(payload = {}) {
   };
 }
 
+function customerConversationMessageKey(message = {}) {
+  return [
+    String(message.sender || message.role || "").trim().toLowerCase(),
+    String(message.content || message.text || "").trim(),
+    String(message.at || "").slice(0, 19),
+  ].join("|");
+}
+
+function mergeCustomerConversations(previousConversation = [], incomingConversation = []) {
+  const previous = Array.isArray(previousConversation) ? previousConversation : [];
+  const incoming = Array.isArray(incomingConversation) ? incomingConversation : [];
+  if (!previous.length) return incoming;
+  if (!incoming.length) return previous;
+
+  const seen = new Set(previous.map(customerConversationMessageKey));
+  const merged = [...previous];
+  for (const message of incoming) {
+    const key = customerConversationMessageKey(message);
+    if (!seen.has(key)) {
+      seen.add(key);
+      merged.push(message);
+    }
+  }
+  return merged.sort((a, b) => {
+    const at = new Date(a?.at || 0).getTime();
+    const bt = new Date(b?.at || 0).getTime();
+    if (!Number.isFinite(at) || !Number.isFinite(bt) || at === bt) return 0;
+    return at - bt;
+  });
+}
+
 async function recordCustomerRequest(payload = {}, req = null) {
   const record = normalizeCustomerRequestRecord(payload);
+  const chatId = record?.estimate_data?.chatId || payload?.chatId || null;
+
+  let previous = null;
+  try {
+    const rows = chatId ? await loadCustomerRequestRows(300) : [];
+    previous = chatId
+      ? dedupeCustomerRequests(rows).find((row) => String(row?.estimate_data?.chatId || row?.id || "") === String(chatId) || String(row?.id || "") === String(chatId))
+      : null;
+  } catch {
+    previous = null;
+  }
+
+  if (previous) {
+    record.conversation = mergeCustomerConversations(previous.conversation, record.conversation);
+    record.customer_name = record.customer_name || previous.customer_name || null;
+    record.phone = record.phone || previous.phone || null;
+    record.email = record.email || previous.email || null;
+    record.location = record.location || previous.location || null;
+    record.project_type = record.project_type || previous.project_type || null;
+    record.estimate_data = {
+      ...(previous.estimate_data || {}),
+      ...(record.estimate_data || {}),
+      chatId: chatId || previous?.estimate_data?.chatId || null,
+    };
+  }
+
   if (!SUPABASE_ENABLED) {
     const file = path.join(DATA_DIR, "customer-requests.json");
     const existing = readJsonFile(file, []);
