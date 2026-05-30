@@ -5,6 +5,7 @@ import OpenAI from "openai";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -15,12 +16,28 @@ const WEB_SEARCH_MODEL = process.env.OPENAI_WEB_SEARCH_MODEL || "gpt-4.1-mini";
 const ENABLE_WEB_SEARCH = process.env.ENABLE_WEB_SEARCH !== "false";
 const STAFF_CONTACT_NAME = process.env.STAFF_CONTACT_NAME || "Sameer Asim";
 const STAFF_CONTACT_PHONE = process.env.SAMEER_CONTACT_PHONE || process.env.COMPANY_PHONE || "";
+const STAFF_EMAIL = String(process.env.STAFF_EMAIL || "").trim().toLowerCase();
+const STAFF_PASSWORD = process.env.STAFF_PASSWORD || "";
+const STAFF_USERS_JSON = process.env.STAFF_USERS_JSON || "";
+const STAFF_TOKEN_TTL_MS = Number(process.env.STAFF_TOKEN_TTL_HOURS || 12) * 60 * 60 * 1000;
+const staffSessions = new Map();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DATA_DIR = path.join(__dirname, "data");
 const LOCAL_BACKUP_FILE = path.join(DATA_DIR, "app-data.json");
 
-app.use(cors());
+const allowedOrigins = (process.env.CORS_ORIGINS || "https://buildupuae.com,https://www.buildupuae.com,https://auto-quote-backend.onrender.com")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(null, true);
+  },
+  credentials: true,
+}));
 app.use(express.json({ limit: "25mb" }));
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -42,6 +59,48 @@ function readJsonFile(filePath, fallback = null) {
   } catch {
     return fallback;
   }
+}
+
+function getConfiguredStaffUsers() {
+  const users = [];
+
+  if (STAFF_USERS_JSON) {
+    try {
+      const parsed = JSON.parse(STAFF_USERS_JSON);
+      if (Array.isArray(parsed)) {
+        parsed.forEach((user) => {
+          const email = String(user?.email || "").trim().toLowerCase();
+          const password = String(user?.password || "");
+          if (email && password) {
+            users.push({
+              email,
+              password,
+              name: String(user?.name || email).trim(),
+              role: String(user?.role || "staff").trim() || "staff",
+            });
+          }
+        });
+      }
+    } catch (error) {
+      console.error("Invalid STAFF_USERS_JSON:", error.message);
+    }
+  }
+
+  if (STAFF_EMAIL && STAFF_PASSWORD) {
+    users.push({ email: STAFF_EMAIL, password: STAFF_PASSWORD, name: STAFF_EMAIL, role: "staff" });
+  }
+
+  return users;
+}
+
+function findStaffUser(email, password) {
+  const cleanEmail = String(email || "").trim().toLowerCase();
+  const cleanPassword = String(password || "");
+  if (!cleanEmail || !cleanPassword) return null;
+
+  return getConfiguredStaffUsers().find((user) => (
+    user.email === cleanEmail && user.password === cleanPassword
+  )) || null;
 }
 
 function cleanJsonText(text = "") {
@@ -399,6 +458,75 @@ function postProcessResult(parsed = {}, { mode, prompt, messages, customer }) {
   return next;
 }
 
+function cleanStaffSessions() {
+  const now = Date.now();
+  for (const [token, session] of staffSessions.entries()) {
+    if (!session?.expiresAt || session.expiresAt <= now) staffSessions.delete(token);
+  }
+}
+
+function createStaffToken(staffUser) {
+  cleanStaffSessions();
+  const token = crypto.randomBytes(32).toString("hex");
+  staffSessions.set(token, {
+    role: staffUser?.role || "staff",
+    email: staffUser?.email || "",
+    name: staffUser?.name || staffUser?.email || "Staff",
+    createdAt: Date.now(),
+    expiresAt: Date.now() + STAFF_TOKEN_TTL_MS,
+  });
+  return token;
+}
+
+function getStaffToken(req) {
+  const header = req.headers.authorization || "";
+  if (header.startsWith("Bearer ")) return header.slice(7).trim();
+  return String(req.headers["x-staff-token"] || "").trim();
+}
+
+function requireStaff(req, res, next) {
+  cleanStaffSessions();
+  const token = getStaffToken(req);
+  const session = token ? staffSessions.get(token) : null;
+  if (!session) {
+    return res.status(401).json({ success: false, ok: false, error: "Staff login required." });
+  }
+  req.staff = session;
+  next();
+}
+
+app.post("/staff-login", (req, res) => {
+  const configuredUsers = getConfiguredStaffUsers();
+  if (!configuredUsers.length) {
+    return res.status(500).json({
+      success: false,
+      ok: false,
+      error: "No staff users are configured on the backend. Add STAFF_EMAIL + STAFF_PASSWORD or STAFF_USERS_JSON in Render environment variables.",
+    });
+  }
+
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
+  const staffUser = findStaffUser(email, password);
+
+  if (!staffUser) {
+    return res.status(401).json({ success: false, ok: false, error: "Invalid staff email or password." });
+  }
+
+  const token = createStaffToken(staffUser);
+  res.json({
+    success: true,
+    ok: true,
+    token,
+    expiresInMs: STAFF_TOKEN_TTL_MS,
+    staff: { email: staffUser.email, name: staffUser.name, role: staffUser.role },
+  });
+});
+
+app.get("/staff-session", requireStaff, (req, res) => {
+  res.json({ success: true, ok: true, staff: { email: req.staff.email, name: req.staff.name, role: req.staff.role } });
+});
+
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -409,19 +537,19 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.get("/local-backup", (req, res) => {
+app.get("/local-backup", requireStaff, (req, res) => {
   const data = readJsonFile(LOCAL_BACKUP_FILE, { ok: false, message: "No local backup found yet." });
   res.json({ ok: true, data });
 });
 
-app.get("/local-backup/download", (req, res) => {
+app.get("/local-backup/download", requireStaff, (req, res) => {
   if (!fs.existsSync(LOCAL_BACKUP_FILE)) {
     return res.status(404).json({ ok: false, error: "No local backup found yet." });
   }
   res.download(LOCAL_BACKUP_FILE, "estimation-grid-app-data.json");
 });
 
-app.post("/local-backup", (req, res) => {
+app.post("/local-backup", requireStaff, (req, res) => {
   const payload = req.body || {};
   const snapshot = {
     ...payload,
@@ -431,7 +559,7 @@ app.post("/local-backup", (req, res) => {
   res.json({ ok: true, success: true, file: LOCAL_BACKUP_FILE, savedAt: snapshot.backendSavedAt });
 });
 
-app.get("/agent-requests", (req, res) => {
+app.get("/agent-requests", requireStaff, (req, res) => {
   res.json({ success: true, requests: handoffRequests.slice(-50).reverse() });
 });
 
@@ -456,6 +584,13 @@ app.post("/ai-estimate", async (req, res) => {
     }
 
     const mode = req.body?.mode === "customer" ? "customer" : "staff";
+    if (mode === "staff") {
+      cleanStaffSessions();
+      const token = getStaffToken(req);
+      if (!token || !staffSessions.has(token)) {
+        return res.status(401).json({ success: false, ok: false, error: "Staff login required for staff AI requests." });
+      }
+    }
     const prompt = normalizeContent(req.body?.prompt).trim();
     const messages = normalizeMessages(req.body?.messages);
     const catalog = Array.isArray(req.body?.catalog) ? req.body.catalog : [];
