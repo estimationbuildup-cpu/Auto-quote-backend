@@ -223,9 +223,9 @@ function normalizeStaffProfileRole(role = "staff", name = "") {
 
 function publicStaffProfile(profile = {}, options = {}) {
   const cleanName = normalizeStaffProfileName(profile?.name || profile?.display_name);
-  const rawRole = profile?.role || "staff";
+  const rawRole = String(profile?.role || "staff").trim().toLowerCase();
   const internalRole = profile?.is_protected || isOwnerStaffProfileName(cleanName) || rawRole === "owner" ? "owner" : normalizeStaffProfileRole(rawRole, cleanName);
-  const canManageUsers = Boolean(profile?.canManageUsers || profile?.is_protected || internalRole === "owner");
+  const canManageUsers = Boolean(profile?.canManageUsers || internalRole === "owner" || internalRole === "admin" || rawRole === "admin");
   const displayRole = internalRole === "owner" ? "admin" : internalRole;
   const publicProfile = {
     id: profile.id || staffProfileIdFromName(cleanName),
@@ -239,7 +239,6 @@ function publicStaffProfile(profile = {}, options = {}) {
 
   if (options.includePermissions) {
     publicProfile.canManageUsers = canManageUsers;
-    if (canManageUsers) publicProfile.protected = true;
   }
 
   return publicProfile;
@@ -292,12 +291,34 @@ function saveStoredStaffProfiles(profiles) {
   writeJsonFile(STAFF_PROFILE_USERS_FILE, Array.isArray(profiles) ? profiles : []);
 }
 
+function getBuiltInAuthorityProfileRaw() {
+  const cleanName = normalizeStaffProfileName(STAFF_OWNER_PROFILE_NAME || "Sameer");
+  const stored = findStoredStaffProfile(cleanName) || {};
+  return {
+    ...stored,
+    id: "builtin-authority-profile",
+    name: cleanName,
+    role: "owner",
+    canManageUsers: true,
+    createdAt: stored.createdAt || null,
+    updatedAt: stored.updatedAt || null,
+  };
+}
+
+function isBuiltInAuthorityProfileId(id = "") {
+  return String(id || "") === "builtin-authority-profile";
+}
+
 function getFileStaffProfiles() {
   const stored = readStoredStaffProfiles();
   const byName = new Map();
 
   DEFAULT_STAFF_PROFILE_NAMES.forEach((name) => {
     const cleanName = normalizeStaffProfileName(name);
+    if (isOwnerStaffProfileName(cleanName)) {
+      byName.set(cleanName.toLowerCase(), publicStaffProfile(getBuiltInAuthorityProfileRaw()));
+      return;
+    }
     byName.set(cleanName.toLowerCase(), publicStaffProfile({
       id: staffProfileIdFromName(cleanName),
       name: cleanName,
@@ -308,6 +329,10 @@ function getFileStaffProfiles() {
   stored.forEach((profile) => {
     const cleanName = normalizeStaffProfileName(profile?.name);
     if (!cleanName) return;
+    if (isOwnerStaffProfileName(cleanName)) {
+      byName.set(cleanName.toLowerCase(), publicStaffProfile(getBuiltInAuthorityProfileRaw()));
+      return;
+    }
     byName.set(cleanName.toLowerCase(), publicStaffProfile(profile));
   });
 
@@ -315,29 +340,64 @@ function getFileStaffProfiles() {
 }
 
 function sortStaffProfilesForDisplay(a, b) {
-  const ai = DEFAULT_STAFF_PROFILE_NAMES.findIndex((name) => name.toLowerCase() === a.name.toLowerCase());
-  const bi = DEFAULT_STAFF_PROFILE_NAMES.findIndex((name) => name.toLowerCase() === b.name.toLowerCase());
+  const ai = DEFAULT_STAFF_PROFILE_NAMES.findIndex((name) => name.toLowerCase() === String(a?.name || "").toLowerCase());
+  const bi = DEFAULT_STAFF_PROFILE_NAMES.findIndex((name) => name.toLowerCase() === String(b?.name || "").toLowerCase());
   if (ai >= 0 || bi >= 0) return (ai >= 0 ? ai : 999) - (bi >= 0 ? bi : 999);
-  return a.name.localeCompare(b.name);
+  return String(a?.name || "").localeCompare(String(b?.name || ""));
+}
+
+function sortStaffProfilesWithOrder(profiles = [], order = []) {
+  const orderMap = new Map((Array.isArray(order) ? order : []).map((name, index) => [normalizeStaffProfileName(name).toLowerCase(), index]));
+  return [...profiles].sort((a, b) => {
+    const ai = orderMap.has(String(a.name || "").toLowerCase()) ? orderMap.get(String(a.name || "").toLowerCase()) : 9999;
+    const bi = orderMap.has(String(b.name || "").toLowerCase()) ? orderMap.get(String(b.name || "").toLowerCase()) : 9999;
+    if (ai !== bi) return ai - bi;
+    return sortStaffProfilesForDisplay(a, b);
+  });
+}
+
+async function getStaffProfileOrder() {
+  if (!SUPABASE_ENABLED) return [];
+  try {
+    const rows = await dbSelect("app_settings", `select=setting_value&setting_key=eq.${encodeEq("staff_user_order")}&limit=1`);
+    const value = Array.isArray(rows) && rows[0]?.setting_value ? rows[0].setting_value : null;
+    return Array.isArray(value?.order) ? value.order : [];
+  } catch (error) {
+    rememberSupabaseIssue("load staff user order", error);
+    return [];
+  }
+}
+
+async function saveStaffProfileOrder(order = [], actor = null) {
+  const cleanOrder = (Array.isArray(order) ? order : []).map(normalizeStaffProfileName).filter(Boolean);
+  if (SUPABASE_ENABLED) {
+    try {
+      const now = new Date().toISOString();
+      await dbUpsert("app_settings", [{
+        setting_key: "staff_user_order",
+        setting_value: { order: cleanOrder },
+        updated_by_name: actor?.name || null,
+        updated_at: now,
+      }], { onConflict: "setting_key", returning: false });
+    } catch (error) {
+      rememberSupabaseIssue("save staff user order", error);
+    }
+  }
+  return cleanOrder;
 }
 
 async function ensureDefaultStaffProfilesInDb() {
   if (!SUPABASE_ENABLED) return;
-  const names = Array.from(new Set([...DEFAULT_STAFF_PROFILE_NAMES, STAFF_OWNER_PROFILE_NAME].filter(Boolean)));
+  const names = Array.from(new Set(DEFAULT_STAFF_PROFILE_NAMES.filter((name) => name && !isOwnerStaffProfileName(name))));
   for (const name of names) {
     const cleanName = normalizeStaffProfileName(name);
     const existing = await dbSelect("staff_users", `select=id,display_name&display_name=eq.${encodeEq(cleanName)}&limit=1`);
-    if (Array.isArray(existing) && existing.length) {
-      if (isOwnerStaffProfileName(cleanName)) {
-        await dbPatch("staff_users", `display_name=eq.${encodeEq(cleanName)}`, { role: "owner", is_protected: true, status: "active", updated_at: new Date().toISOString() }, { returning: false });
-      }
-      continue;
-    }
+    if (Array.isArray(existing) && existing.length) continue;
     await dbInsert("staff_users", [{
       display_name: cleanName,
-      role: isOwnerStaffProfileName(cleanName) ? "owner" : "staff",
+      role: "staff",
       status: "active",
-      is_protected: isOwnerStaffProfileName(cleanName),
+      is_protected: false,
     }], { returning: false });
   }
 }
@@ -346,7 +406,13 @@ async function getDbStaffProfiles({ includeInactive = false } = {}) {
   await ensureDefaultStaffProfilesInDb();
   const statusFilter = includeInactive ? "" : "&status=eq.active";
   const rows = await dbSelect("staff_users", `select=*&order=created_at.asc${statusFilter}`);
-  return (Array.isArray(rows) ? rows : []).map((row) => publicStaffProfile(row)).sort(sortStaffProfilesForDisplay);
+  const profiles = [
+    publicStaffProfile(getBuiltInAuthorityProfileRaw()),
+    ...(Array.isArray(rows) ? rows : [])
+      .filter((row) => !isOwnerStaffProfileName(row?.display_name))
+      .map((row) => publicStaffProfile(row)),
+  ];
+  return sortStaffProfilesWithOrder(profiles, await getStaffProfileOrder());
 }
 
 async function getStaffProfiles() {
@@ -370,6 +436,7 @@ function findStoredStaffProfile(name = "") {
 async function findStaffProfileRecord(name = "") {
   const cleanName = normalizeStaffProfileName(name);
   if (!cleanName) return null;
+  if (isOwnerStaffProfileName(cleanName)) return getBuiltInAuthorityProfileRaw();
   if (SUPABASE_ENABLED) {
     try {
       await ensureDefaultStaffProfilesInDb();
@@ -422,6 +489,10 @@ async function createOrUpdateStaffProfile({ name, password, role = "staff", requ
   if (!cleanName) throw new Error("Staff user name is required.");
   if (requirePassword && cleanPassword.length < 4) throw new Error("Staff user password must be at least 4 characters.");
   if (cleanPassword && cleanPassword.length < 4) throw new Error("Staff user password must be at least 4 characters.");
+
+  if (isOwnerStaffProfileName(cleanName)) {
+    return createOrUpdateStaffProfileFile({ name: cleanName, password: cleanPassword, role: "owner", requirePassword });
+  }
 
   if (SUPABASE_ENABLED) {
     try {
@@ -478,9 +549,14 @@ function getActiveStaffProfile(req) {
   return req?.staff?.activeUser || null;
 }
 
-function activeStaffIsOwner(req) {
+function activeStaffCanManageUsers(req) {
   const active = getActiveStaffProfile(req);
-  return Boolean(active?.canManageUsers || isOwnerStaffProfileName(active?.name));
+  const role = String(active?.role || "").toLowerCase();
+  return Boolean(active?.canManageUsers || role === "admin" || isOwnerStaffProfileName(active?.name));
+}
+
+function activeStaffIsOwner(req) {
+  return activeStaffCanManageUsers(req);
 }
 
 function getConfiguredStaffUsers() {
@@ -1430,7 +1506,7 @@ app.post("/staff-users/login", requireStaff, async (req, res) => {
     }
 
     const user = publicStaffProfile(profile, { includePermissions: true });
-    if (SUPABASE_ENABLED && profile?.id) {
+    if (SUPABASE_ENABLED && profile?.id && isUuid(profile.id)) {
       try {
         await dbPatch("staff_users", `id=eq.${encodeEq(profile.id)}`, { last_login_at: new Date().toISOString() }, { returning: false });
       } catch (error) {
@@ -1500,13 +1576,80 @@ app.post("/staff-users", requireStaff, async (req, res) => {
   }
 });
 
+app.patch("/staff-users/:id", requireStaff, async (req, res) => {
+  try {
+    if (!activeStaffCanManageUsers(req)) {
+      return res.status(403).json({ success: false, ok: false, error: "You do not have permission to edit staff users." });
+    }
+    const id = String(req.params.id || "").trim();
+    const requestedRole = normalizeStaffProfileRole(req.body?.role || "staff");
+    if (isBuiltInAuthorityProfileId(id)) {
+      return res.status(403).json({ success: false, ok: false, error: "This profile cannot be changed." });
+    }
+    if (SUPABASE_ENABLED) {
+      const rows = await dbSelect("staff_users", `select=*&id=eq.${encodeEq(id)}&limit=1`);
+      const target = Array.isArray(rows) && rows.length ? rows[0] : null;
+      if (!target) return res.status(404).json({ success: false, ok: false, error: "Staff user not found." });
+      if (isOwnerStaffProfileName(target.display_name)) {
+        return res.status(403).json({ success: false, ok: false, error: "This profile cannot be changed." });
+      }
+      const updatedRows = await dbPatch("staff_users", `id=eq.${encodeEq(id)}`, {
+        role: requestedRole,
+        updated_at: new Date().toISOString(),
+        updated_by: isUuid(getActiveStaffProfile(req)?.id) ? getActiveStaffProfile(req).id : null,
+      });
+      const updated = Array.isArray(updatedRows) && updatedRows.length ? updatedRows[0] : { ...target, role: requestedRole };
+      await writeAuditLog(req, {
+        action_type: "staff_user_role_updated",
+        module: "user_management",
+        target_table: "staff_users",
+        target_id: target.id,
+        field_name: "role",
+        old_value: target.role,
+        new_value: requestedRole,
+        old_snapshot: target,
+        new_snapshot: updated,
+        change_summary: `${getActiveStaffProfile(req)?.name || "Staff"} changed ${target.display_name} role from ${target.role || "staff"} to ${requestedRole}.`,
+      });
+      return res.json({ success: true, ok: true, user: publicStaffProfile(updated), users: await getStaffProfiles() });
+    }
+    return res.status(400).json({ success: false, ok: false, error: "Database is required to update user roles." });
+  } catch (error) {
+    console.error("Update staff user error:", error);
+    res.status(500).json({ success: false, ok: false, error: error.message || "Could not update staff user." });
+  }
+});
+
+app.patch("/staff-users-order", requireStaff, async (req, res) => {
+  try {
+    if (!activeStaffCanManageUsers(req)) {
+      return res.status(403).json({ success: false, ok: false, error: "You do not have permission to reorder staff users." });
+    }
+    const order = await saveStaffProfileOrder(req.body?.order || [], getActiveStaffProfile(req));
+    await writeAuditLog(req, {
+      action_type: "staff_user_order_updated",
+      module: "user_management",
+      target_table: "staff_users",
+      new_snapshot: { order },
+      change_summary: `${getActiveStaffProfile(req)?.name || "Staff"} changed staff user list order.`,
+    });
+    res.json({ success: true, ok: true, users: await getStaffProfiles() });
+  } catch (error) {
+    console.error("Reorder staff users error:", error);
+    res.status(500).json({ success: false, ok: false, error: error.message || "Could not reorder staff users." });
+  }
+});
+
 app.delete("/staff-users/:id", requireStaff, async (req, res) => {
   try {
-    if (!activeStaffIsOwner(req)) {
+    if (!activeStaffCanManageUsers(req)) {
       return res.status(403).json({ success: false, ok: false, error: "You do not have permission to remove staff users." });
     }
 
     const id = String(req.params.id || "").trim();
+    if (isBuiltInAuthorityProfileId(id) || isOwnerStaffProfileName(id)) {
+      return res.status(403).json({ success: false, ok: false, error: "This profile cannot be removed." });
+    }
 
     if (SUPABASE_ENABLED) {
       const rows = await dbSelect("staff_users", `select=*&id=eq.${encodeEq(id)}&limit=1`);
