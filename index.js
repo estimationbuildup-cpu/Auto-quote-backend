@@ -743,7 +743,10 @@ function isPositiveConfirmation(text = "") {
 function shouldUseWebSearch({ mode, prompt = "", messages = [] }) {
   if (!ENABLE_WEB_SEARCH || mode !== "customer") return false;
   const text = `${prompt}\n${conversationText(messages)}`.toLowerCase();
-  return /\b(best|recommend|suggest|which system|what system|suitable|limitation|maximum|latest|current|search|internet|website|specification|standard|thermal break|5\s*meter|5000\s*mm|large opening|wide opening|sliding or folding|folding or sliding)\b/.test(text);
+  // GPT-5.5 should use web search more often for customer-facing guidance,
+  // especially when the customer asks about suitability, product options,
+  // standards, limitations, current info, or anything uncertain.
+  return /\b(best|recommend|suggest|which|what system|suitable|limitation|maximum|latest|current|search|internet|website|specification|standard|thermal break|5\s*meter|5000\s*mm|large opening|wide opening|sliding or folding|folding or sliding|compare|difference|option|available|can you|is it possible|safe|strong|waterproof|soundproof|heat|insulation|price range|dubai|uae)\b/.test(text);
 }
 
 function extractCustomerUpdatesFromText(text = "") {
@@ -851,8 +854,8 @@ Core behavior:
 - Do NOT repeat the same question again and again. If already asked, continue from the customer's latest answer.
 - Use the conversation history. Continue naturally and remember what the customer already answered.
 - Do not overwhelm the customer with a list of many fields in one message.
-- Do not promise final price, structural approval, exact delivery date, or final panel design without staff review.
-- If unsure even after reasonable reasoning/search, apologize and offer real staff handoff.
+- Do not promise final price, structural approval, exact delivery date, or final panel design without staff review. Say estimated/AI draft pricing can vary after team/site verification.
+- If a business-specific answer is uncertain, do not say "I don't know". Say that you will check with the team, offer a real staff handoff, and continue collecting useful quote details.
 
 Conversation order for customer mode:
 1. Understand product type first.
@@ -915,6 +918,8 @@ JSON output shape:
 You are talking to a CUSTOMER, not staff.
 Use warm, short, professional WhatsApp-style language.
 Do not reveal internal pricing/catalog settings.
+Use web/search support when the customer asks about current suitability, comparisons, options, standards, or product guidance.
+Do not say "I don't know" to customers; for uncertain company-specific items, say "I will check with the team" and offer staff support.
 Do not ask all questions at once. Ask the next 1-3 useful questions only.
 If the customer asks a general advice question like "sliding or folding", answer with simple pros/cons from your own knowledge and the company catalog. Do not say you searched or asked ChatGPT.
 Example: If customer says "Doors" and asks what kinds: reply only with the door options, such as "We have Slim Sliding Doors, Folding Doors and Hinged Doors. Which one do you prefer?" Do NOT also ask size, name, phone and location in that same message.
@@ -1027,7 +1032,7 @@ function postProcessResult(parsed = {}, { mode, prompt, messages, customer }) {
 
   if (!next.reply) {
     if (next.mode === "handoff_offer") {
-      next.reply = "I am really sorry, I am not fully sure about that. I am a chatbot and I have some limitations. Would you like me to connect you with a real staff member?";
+      next.reply = "I will check this with the team to avoid giving wrong information. Would you like me to connect you with a real staff member?";
       next.handoff_offer = true;
     } else if (missingRequired.length && mode === "customer") {
       next.reply = `Sure, I can help. Before staff prepares the quote, please share your ${missingRequired.join(", ")}.`;
@@ -1380,7 +1385,7 @@ function notificationSectionsFromRequests(rows = []) {
   const statusOf = (row) => String(row?.status || row?.estimate_data?.eventType || "").toLowerCase();
   return {
     all: deduped,
-    realAgent: deduped.filter((row) => statusOf(row).includes("agent")),
+    realAgent: deduped.filter((row) => { const status = statusOf(row); return status.includes("agent") || status.includes("staff_active") || status.includes("customer_waiting_staff"); }),
     aiSubmitted: deduped.filter((row) => statusOf(row).includes("submitted")),
     needsReview: deduped.filter((row) => statusOf(row).includes("review")),
     locationSiteWork: deduped.filter((row) => {
@@ -1424,10 +1429,11 @@ async function writeSiteVisitBookings(value = {}, req = null) {
 
 function generateSiteVisitSlots(bookings = []) {
   const booked = new Set((bookings || []).filter((b) => b.status !== "cancelled").map((b) => b.slotId));
-  const slotHours = ["10:00", "12:00", "15:00", "16:30"];
+  // Site visits are offered from 8 AM to 4 PM only.
+  const slotHours = ["08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00"];
   const slots = [];
   const today = new Date();
-  for (let dayOffset = 1; dayOffset <= 10 && slots.length < 18; dayOffset += 1) {
+  for (let dayOffset = 1; dayOffset <= 10 && slots.length < 30; dayOffset += 1) {
     const d = new Date(today);
     d.setDate(today.getDate() + dayOffset);
     const weekday = d.getDay();
@@ -1438,8 +1444,35 @@ function generateSiteVisitSlots(bookings = []) {
       if (!booked.has(slotId)) slots.push({ slotId, date, time, label: `${date} at ${time}` });
     });
   }
-  return slots.slice(0, 12);
+  return slots.slice(0, 18);
 }
+
+function validCustomerLocation(value = "") {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  if (/google\.com\/maps|maps\.app\.goo\.gl|goo\.gl\/maps|maps\?q=|-?\d{1,2}\.\d+\s*,\s*-?\d{1,3}\.\d+/i.test(text)) return true;
+  return /dubai|sharjah|ajman|abu dhabi|al ain|jvc|jlt|marina|downtown|business bay|mirdif|warisan|nad al hamar|al quoz|deira|bur dubai|silicon|meydan|jumeirah|rak|ras al khaimah|fujairah|uaq|umm al quwain/i.test(text) && text.length >= 3;
+}
+
+function hasProductInterestForSiteVisit(body = {}) {
+  const rows = Array.isArray(body.rows) ? body.rows : [];
+  const items = Array.isArray(body.items) ? body.items : [];
+  const messages = normalizeMessages(body.messages || body.conversation || []);
+  const projectType = normalizeContent(body.customer?.projectType || body.customer?.productInquired || body.projectType || "");
+  const text = `${projectType} ${messages.map((m) => m.content).join(" ")}`.toLowerCase();
+  return rows.length > 0 || items.length > 0 || /sliding|folding|hinged|door|window|fixed glass|partition|shower|curtain wall|glass|aluminium|aluminum|pergola|skylight/.test(text);
+}
+
+function siteVisitMissingRequirements(body = {}) {
+  const customer = body.customer || {};
+  const missing = [];
+  if (!String(customer.name || customer.customerName || customer.clientName || "").trim()) missing.push("name");
+  if (!String(customer.phone || customer.phoneNumber || "").trim()) missing.push("phone number");
+  if (!validCustomerLocation(customer.location || body.location || "")) missing.push("valid Google Maps location / site area");
+  if (!hasProductInterestForSiteVisit(body)) missing.push("product interest / quote details");
+  return missing;
+}
+
 
 
 async function auditQuoteChanges(previousState, nextState, req) {
@@ -1968,6 +2001,99 @@ app.get("/audit-logs", requireStaff, async (req, res) => {
   }
 });
 
+
+app.get("/customer-chat-session/:chatId", async (req, res) => {
+  try {
+    const chatId = String(req.params.chatId || "").trim();
+    if (!chatId) return res.status(400).json({ ok: false, success: false, error: "Missing chat session." });
+    const rows = await loadCustomerRequestRows(300);
+    const match = dedupeCustomerRequests(rows).find((row) => String(row?.estimate_data?.chatId || row?.id || "") === chatId || String(row?.id || "") === chatId);
+    if (!match) return res.status(404).json({ ok: false, success: false, error: "Chat session not found." });
+    res.json({ ok: true, success: true, request: match });
+  } catch (error) {
+    rememberSupabaseIssue("customer chat session load", error);
+    res.status(500).json({ ok: false, success: false, error: "Could not load customer chat session." });
+  }
+});
+
+app.post("/customer-chat-message", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const sender = body.sender === "staff" ? "staff" : "customer";
+    if (sender === "staff") {
+      cleanStaffSessions();
+      const token = getStaffToken(req);
+      const session = token ? staffSessions.get(token) : null;
+      if (!session) return res.status(401).json({ ok: false, success: false, error: "Staff login required to reply." });
+      req.staff = session;
+    }
+    const text = normalizeContent(body.text || body.message || "").trim();
+    if (!text) return res.status(400).json({ ok: false, success: false, error: "Message is required." });
+    const chatId = body.chatId || body.id || `customer_chat_${Date.now().toString(36)}`;
+    const rows = await loadCustomerRequestRows(300);
+    const previous = dedupeCustomerRequests(rows).find((row) => String(row?.estimate_data?.chatId || row?.id || "") === String(chatId) || String(row?.id || "") === String(chatId));
+    const previousConversation = Array.isArray(previous?.conversation) ? previous.conversation : [];
+    const nextMessage = {
+      role: sender === "staff" ? "assistant" : "user",
+      sender,
+      content: text,
+      text,
+      at: new Date().toISOString(),
+      staffName: sender === "staff" ? (body.staffName || getActiveStaffProfile(req)?.name || req.staff?.name || "Staff") : null,
+    };
+    const status = sender === "staff" ? "staff_active" : (previous?.status || "real_agent_requested");
+    const row = await recordCustomerRequest({
+      chatId,
+      customer: body.customer || previous || {},
+      conversation: [...previousConversation, nextMessage],
+      status,
+      eventType: status,
+      note: sender === "staff" ? "Staff replied to customer chat." : "Customer sent a message while waiting for staff.",
+      estimate_data: {
+        ...(previous?.estimate_data || {}),
+        chatId,
+        staffControl: status === "staff_active",
+        sessionStatus: status,
+        lastManualMessageAt: nextMessage.at,
+      },
+    }, req);
+    res.json({ ok: true, success: true, request: row, message: nextMessage });
+  } catch (error) {
+    rememberSupabaseIssue("customer chat message", error);
+    res.status(500).json({ ok: false, success: false, error: "Could not send chat message." });
+  }
+});
+
+app.post("/customer-chat-session-status", requireStaff, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const chatId = String(body.chatId || body.id || "").trim();
+    const status = String(body.status || "").trim() || "staff_active";
+    if (!chatId) return res.status(400).json({ ok: false, success: false, error: "Missing chat session." });
+    const rows = await loadCustomerRequestRows(300);
+    const previous = dedupeCustomerRequests(rows).find((row) => String(row?.estimate_data?.chatId || row?.id || "") === chatId || String(row?.id || "") === chatId);
+    const row = await recordCustomerRequest({
+      chatId,
+      customer: body.customer || previous || {},
+      conversation: Array.isArray(previous?.conversation) ? previous.conversation : [],
+      status,
+      eventType: status,
+      note: body.note || `Chat session status changed to ${status}.`,
+      estimate_data: {
+        ...(previous?.estimate_data || {}),
+        chatId,
+        staffControl: status === "staff_active",
+        sessionStatus: status,
+        closedAt: status === "session_closed" ? new Date().toISOString() : previous?.estimate_data?.closedAt || null,
+      },
+    }, req);
+    res.json({ ok: true, success: true, request: row });
+  } catch (error) {
+    rememberSupabaseIssue("customer chat session status", error);
+    res.status(500).json({ ok: false, success: false, error: "Could not update chat session." });
+  }
+});
+
 app.post("/customer-request", async (req, res) => {
   try {
     const row = await recordCustomerRequest(req.body || {}, req);
@@ -2041,6 +2167,10 @@ app.post("/site-visit-booking", async (req, res) => {
     const slot = body.slot || {};
     const slotId = slot.slotId || body.slotId;
     if (!slotId) return res.status(400).json({ ok: false, success: false, error: "Missing site visit slot." });
+    const missing = siteVisitMissingRequirements(body);
+    if (missing.length) {
+      return res.status(400).json({ ok: false, success: false, error: `Site visit can be booked after receiving: ${missing.join(", ")}.` });
+    }
     const data = await readSiteVisitBookings();
     const bookings = Array.isArray(data.bookings) ? data.bookings : [];
     const existing = bookings.find((booking) => booking.slotId === slotId && booking.status !== "cancelled");
@@ -2053,6 +2183,8 @@ app.post("/site-visit-booking", async (req, res) => {
       label: slot.label || body.label || slotId,
       customer: body.customer || {},
       chatId: body.chatId || null,
+      rows: Array.isArray(body.rows) ? body.rows : [],
+      items: Array.isArray(body.items) ? body.items : [],
       status: "booked",
       createdAt: new Date().toISOString(),
     };
@@ -2064,6 +2196,8 @@ app.post("/site-visit-booking", async (req, res) => {
       status: "site_visit_booked",
       eventType: "site_visit_booked",
       siteVisit: booking,
+      rows: Array.isArray(body.rows) ? body.rows : [],
+      items: Array.isArray(body.items) ? body.items : [],
       note: `Customer booked site visit: ${booking.label}`,
     }, req);
     res.json({ ok: true, success: true, booking });
