@@ -11,8 +11,9 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
-const WEB_SEARCH_MODEL = process.env.OPENAI_WEB_SEARCH_MODEL || "gpt-4.1-mini";
+const DEFAULT_OPENAI_MODEL = "gpt-5.5";
+const MODEL = String(process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL).trim();
+const WEB_SEARCH_MODEL = String(process.env.OPENAI_WEB_SEARCH_MODEL || MODEL).trim();
 const ENABLE_WEB_SEARCH = process.env.ENABLE_WEB_SEARCH !== "false";
 const STAFF_CONTACT_NAME = process.env.STAFF_CONTACT_NAME || "Sameer Asim";
 const STAFF_CONTACT_PHONE = process.env.SAMEER_CONTACT_PHONE || process.env.COMPANY_PHONE || "";
