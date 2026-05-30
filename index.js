@@ -34,6 +34,20 @@ const FRONTEND_ROWS_STORAGE_KEY = "estimation-grid-rows-v8";
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || "";
 const SUPABASE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+let latestSupabaseIssue = null;
+
+function rememberSupabaseIssue(context, error) {
+  latestSupabaseIssue = {
+    context,
+    message: error?.message || String(error || "Unknown database error"),
+    at: new Date().toISOString(),
+  };
+  console.error(`[Supabase] ${context}:`, error?.message || error);
+}
+
+function publicDatabaseError(fallback = "Database connection needs checking on the backend.") {
+  return fallback;
+}
 
 const allowedOrigins = (process.env.CORS_ORIGINS || "https://buildupuae.com,https://www.buildupuae.com,https://auto-quote-backend.onrender.com")
   .split(",")
@@ -336,7 +350,14 @@ async function getDbStaffProfiles({ includeInactive = false } = {}) {
 }
 
 async function getStaffProfiles() {
-  if (SUPABASE_ENABLED) return getDbStaffProfiles();
+  if (SUPABASE_ENABLED) {
+    try {
+      return await getDbStaffProfiles();
+    } catch (error) {
+      rememberSupabaseIssue("load staff users", error);
+      return getFileStaffProfiles();
+    }
+  }
   return getFileStaffProfiles();
 }
 
@@ -350,9 +371,13 @@ async function findStaffProfileRecord(name = "") {
   const cleanName = normalizeStaffProfileName(name);
   if (!cleanName) return null;
   if (SUPABASE_ENABLED) {
-    await ensureDefaultStaffProfilesInDb();
-    const rows = await dbSelect("staff_users", `select=*&display_name=eq.${encodeEq(cleanName)}&status=eq.active&limit=1`);
-    return Array.isArray(rows) && rows.length ? rows[0] : null;
+    try {
+      await ensureDefaultStaffProfilesInDb();
+      const rows = await dbSelect("staff_users", `select=*&display_name=eq.${encodeEq(cleanName)}&status=eq.active&limit=1`);
+      return Array.isArray(rows) && rows.length ? rows[0] : null;
+    } catch (error) {
+      rememberSupabaseIssue("find staff user", error);
+    }
   }
   return findStoredStaffProfile(cleanName);
 }
@@ -398,34 +423,40 @@ async function createOrUpdateStaffProfile({ name, password, role = "staff", requ
   if (requirePassword && cleanPassword.length < 4) throw new Error("Staff user password must be at least 4 characters.");
   if (cleanPassword && cleanPassword.length < 4) throw new Error("Staff user password must be at least 4 characters.");
 
-  if (!SUPABASE_ENABLED) return createOrUpdateStaffProfileFile({ name: cleanName, password: cleanPassword, role, requirePassword });
+  if (SUPABASE_ENABLED) {
+    try {
+      await ensureDefaultStaffProfilesInDb();
+      const existingRows = await dbSelect("staff_users", `select=*&display_name=eq.${encodeEq(cleanName)}&limit=1`);
+      const existing = Array.isArray(existingRows) && existingRows.length ? existingRows[0] : null;
+      const now = new Date().toISOString();
+      const nextRole = normalizeStaffProfileRole(role || existing?.role || "staff", cleanName);
+      const patch = {
+        display_name: cleanName,
+        role: isOwnerStaffProfileName(cleanName) ? "owner" : nextRole,
+        status: "active",
+        is_protected: isOwnerStaffProfileName(cleanName) || Boolean(existing?.is_protected),
+        updated_at: now,
+      };
+      if (isUuid(actor?.id)) patch.updated_by = actor.id;
+      if (cleanPassword) patch.password_hash = encodeStaffProfilePassword(cleanPassword);
 
-  await ensureDefaultStaffProfilesInDb();
-  const existingRows = await dbSelect("staff_users", `select=*&display_name=eq.${encodeEq(cleanName)}&limit=1`);
-  const existing = Array.isArray(existingRows) && existingRows.length ? existingRows[0] : null;
-  const now = new Date().toISOString();
-  const nextRole = normalizeStaffProfileRole(role || existing?.role || "staff", cleanName);
-  const patch = {
-    display_name: cleanName,
-    role: isOwnerStaffProfileName(cleanName) ? "owner" : nextRole,
-    status: "active",
-    is_protected: isOwnerStaffProfileName(cleanName) || Boolean(existing?.is_protected),
-    updated_at: now,
-  };
-  if (isUuid(actor?.id)) patch.updated_by = actor.id;
-  if (cleanPassword) patch.password_hash = encodeStaffProfilePassword(cleanPassword);
-
-  let saved;
-  if (existing?.id) {
-    const rows = await dbPatch("staff_users", `id=eq.${encodeEq(existing.id)}`, patch);
-    saved = Array.isArray(rows) && rows.length ? rows[0] : { ...existing, ...patch };
-  } else {
-    const insert = { ...patch, created_at: now };
-    if (isUuid(actor?.id)) insert.created_by = actor.id;
-    const rows = await dbInsert("staff_users", [insert]);
-    saved = Array.isArray(rows) && rows.length ? rows[0] : insert;
+      let saved;
+      if (existing?.id) {
+        const rows = await dbPatch("staff_users", `id=eq.${encodeEq(existing.id)}`, patch);
+        saved = Array.isArray(rows) && rows.length ? rows[0] : { ...existing, ...patch };
+      } else {
+        const insert = { ...patch, created_at: now };
+        if (isUuid(actor?.id)) insert.created_by = actor.id;
+        const rows = await dbInsert("staff_users", [insert]);
+        saved = Array.isArray(rows) && rows.length ? rows[0] : insert;
+      }
+      return publicStaffProfile(saved, { includePermissions: true });
+    } catch (error) {
+      rememberSupabaseIssue("save staff user", error);
+    }
   }
-  return publicStaffProfile(saved, { includePermissions: true });
+
+  return createOrUpdateStaffProfileFile({ name: cleanName, password: cleanPassword, role, requirePassword });
 }
 
 function setActiveProfileForRequest(req, user) {
@@ -1380,29 +1411,38 @@ app.get("/staff-users", requireStaff, async (req, res) => {
     res.json({ success: true, ok: true, users: await getStaffProfiles() });
   } catch (error) {
     console.error("Staff users load error:", error);
-    res.status(500).json({ success: false, ok: false, error: error.message || "Could not load staff users." });
+    res.status(500).json({ success: false, ok: false, error: publicDatabaseError("Could not load staff users. Check backend database settings.") });
   }
 });
 
 app.post("/staff-users/login", requireStaff, async (req, res) => {
-  const name = normalizeStaffProfileName(req.body?.name);
-  const password = String(req.body?.password || "");
-  const profile = await findStaffProfileRecord(name);
+  try {
+    const name = normalizeStaffProfileName(req.body?.name);
+    const password = String(req.body?.password || "");
+    const profile = await findStaffProfileRecord(name);
 
-  if (!profile || !(profile.passwordHash || profile.password_hash)) {
-    return res.status(404).json({ success: false, ok: false, error: "This staff user does not have a password yet. Create the password first." });
-  }
+    if (!profile || !(profile.passwordHash || profile.password_hash)) {
+      return res.status(404).json({ success: false, ok: false, error: "This staff user does not have a password yet. Create the password first." });
+    }
 
-  if (!verifyStaffProfilePassword(password, profile)) {
-    return res.status(401).json({ success: false, ok: false, error: "Incorrect user password." });
-  }
+    if (!verifyStaffProfilePassword(password, profile)) {
+      return res.status(401).json({ success: false, ok: false, error: "Incorrect user password." });
+    }
 
-  const user = publicStaffProfile(profile, { includePermissions: true });
-  if (SUPABASE_ENABLED && profile?.id) {
-    await dbPatch("staff_users", `id=eq.${encodeEq(profile.id)}`, { last_login_at: new Date().toISOString() }, { returning: false });
+    const user = publicStaffProfile(profile, { includePermissions: true });
+    if (SUPABASE_ENABLED && profile?.id) {
+      try {
+        await dbPatch("staff_users", `id=eq.${encodeEq(profile.id)}`, { last_login_at: new Date().toISOString() }, { returning: false });
+      } catch (error) {
+        rememberSupabaseIssue("update staff last_login_at", error);
+      }
+    }
+    setActiveProfileForRequest(req, { ...profile, name: user.name });
+    res.json({ success: true, ok: true, user });
+  } catch (error) {
+    console.error("Staff profile login error:", error);
+    res.status(500).json({ success: false, ok: false, error: "Could not open this staff profile. Check backend database settings." });
   }
-  setActiveProfileForRequest(req, { ...profile, name: user.name });
-  res.json({ success: true, ok: true, user });
 });
 
 app.post("/staff-users", requireStaff, async (req, res) => {
@@ -1452,7 +1492,11 @@ app.post("/staff-users", requireStaff, async (req, res) => {
     });
     res.json({ success: true, ok: true, user: userWithPermissions, users: await getStaffProfiles() });
   } catch (error) {
-    res.status(400).json({ success: false, ok: false, error: error.message || "Could not save staff user." });
+    console.error("Save staff user error:", error);
+    const message = /Supabase|staff_users|rest\/v1/i.test(String(error?.message || ""))
+      ? "Could not save staff user. Check backend database settings."
+      : (error.message || "Could not save staff user.");
+    res.status(400).json({ success: false, ok: false, error: message });
   }
 });
 
@@ -1537,7 +1581,8 @@ app.get("/db-health", requireStaff, async (req, res) => {
       checkedTables: { audit_logs: Array.isArray(auditSample), staff_users: Array.isArray(userSample) },
     });
   } catch (error) {
-    res.status(500).json({ ok: false, success: false, databaseEnabled: true, error: error.message || "Database check failed." });
+    rememberSupabaseIssue("database health check", error);
+    res.status(500).json({ ok: false, success: false, databaseEnabled: true, error: "Database check failed. Verify SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and RLS setup in Render/Supabase.", latestIssueAt: latestSupabaseIssue?.at || null });
   }
 });
 
@@ -1600,13 +1645,14 @@ app.post("/local-backup", requireStaff, async (req, res) => {
       savedAt: snapshot.backendSavedAt,
     });
   } catch (error) {
-    console.error("Local backup/Supabase sync failed:", error);
+    rememberSupabaseIssue("local backup cloud sync", error);
     writeJsonFile(LOCAL_BACKUP_FILE, snapshot);
-    res.status(500).json({
-      ok: false,
-      success: false,
-      error: error.message || "Could not save app data to Supabase.",
-      fileBackupSaved: true,
+    res.json({
+      ok: true,
+      success: true,
+      storage: "local-file",
+      cloudWarning: "Saved locally on backend, but cloud database sync needs checking.",
+      file: LOCAL_BACKUP_FILE,
       savedAt: snapshot.backendSavedAt,
     });
   }

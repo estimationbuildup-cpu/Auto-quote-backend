@@ -1,0 +1,31 @@
+[
+  {
+    "id": "audit_mprytvd3_1s1unj",
+    "created_at": "2026-05-30T06:24:15.879Z",
+    "actor_user_id": null,
+    "actor_name": "Rasheed",
+    "actor_role": "staff",
+    "action_type": "staff_user_created",
+    "module": "user_management",
+    "target_table": "staff_users",
+    "target_id": "rasheed-mprytva3",
+    "quote_id": null,
+    "quote_number": null,
+    "item_id": null,
+    "item_code": null,
+    "item_product": null,
+    "field_name": null,
+    "old_value": null,
+    "new_value": null,
+    "old_snapshot": null,
+    "new_snapshot": {
+      "id": "rasheed-mprytva3",
+      "name": "Rasheed",
+      "role": "staff"
+    },
+    "changed_fields": null,
+    "change_summary": "Rasheed created staff profile Rasheed.",
+    "ip_address": "::ffff:127.0.0.1",
+    "device_info": "curl/8.10.1"
+  }
+]

@@ -1,0 +1,11 @@
+[
+  {
+    "id": "rasheed-mprytva3",
+    "name": "Rasheed",
+    "role": "staff",
+    "createdAt": "2026-05-30T06:24:15.771Z",
+    "updatedAt": "2026-05-30T06:24:15.771Z",
+    "passwordHash": "1b99b6ac704616370a6190b1eef62727641c42cc40d496b79132cd2304fd8a2eda649ae28c7b40c7cdf8d5677b86a9843732883767a75bd43fef7e6991da53b8",
+    "salt": "479ab7c5d7c534cddd6165f1171c4aaa"
+  }
+]
