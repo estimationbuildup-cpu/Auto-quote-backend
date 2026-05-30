@@ -1343,9 +1343,13 @@ function normalizeCustomerRequestRecord(payload = {}) {
 
 function customerConversationMessageKey(message = {}) {
   // Do not include timestamp/id in the key. The duplicate bug created the same visible
-  // message with different timestamps, so timestamp-based keys failed to remove repeats.
+  // message with different timestamps and different sender labels (user/customer).
+  const role = normalizeRole(message.role);
+  const rawSender = String(message.sender || "").trim().toLowerCase();
+  const sender = role === "user" ? "customer" : rawSender === "staff" ? "staff" : "assistant";
   return [
-    String(message.sender || message.role || "").trim().toLowerCase(),
+    role,
+    sender,
     String(message.content || message.text || "").replace(/\s+/g, " ").trim().toLowerCase(),
   ].join("|");
 }
@@ -1364,7 +1368,10 @@ function mergeCustomerConversations(previousConversation = [], incomingConversat
     const key = customerConversationMessageKey({ ...message, content: text, text });
     if (seen.has(key)) continue;
     seen.add(key);
-    merged.push({ ...message, content: message.content ?? text, text: message.text ?? text });
+    const role = normalizeRole(message.role);
+    const rawSender = String(message.sender || "").trim().toLowerCase();
+    const sender = role === "user" ? "customer" : rawSender === "staff" ? "staff" : "assistant";
+    merged.push({ ...message, role, sender, content: message.content ?? text, text: message.text ?? text });
   }
 
   return merged.sort((a, b) => {
