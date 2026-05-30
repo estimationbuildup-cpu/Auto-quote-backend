@@ -28,6 +28,8 @@ const LOCAL_BACKUP_FILE = path.join(DATA_DIR, "app-data.json");
 const STAFF_PROFILE_USERS_FILE = path.join(DATA_DIR, "staff-users.json");
 const DEFAULT_STAFF_PROFILE_NAMES = ["Sameer", "Sajid", "Rasheed", "Jithin", "Arafat"];
 const STAFF_OWNER_PROFILE_NAME = normalizeStaffProfileName(process.env.STAFF_OWNER_PROFILE_NAME || "Sameer");
+const BUILT_IN_AUTHORITY_PROFILE_ID = "builtin-authority-profile";
+const BUILT_IN_AUTHORITY_SETTING_KEY = "builtin_authority_profile";
 const FRONTEND_SETTINGS_STORAGE_KEY = "estimation-grid-pro-v2";
 const FRONTEND_QUOTATION_STORAGE_KEY = "estimation-grid-quotation-v2";
 const FRONTEND_ROWS_STORAGE_KEY = "estimation-grid-rows-v8";
@@ -296,7 +298,7 @@ function getBuiltInAuthorityProfileRaw() {
   const stored = findStoredStaffProfile(cleanName) || {};
   return {
     ...stored,
-    id: "builtin-authority-profile",
+    id: BUILT_IN_AUTHORITY_PROFILE_ID,
     name: cleanName,
     role: "owner",
     canManageUsers: true,
@@ -305,8 +307,68 @@ function getBuiltInAuthorityProfileRaw() {
   };
 }
 
+async function getBuiltInAuthorityProfileRecord() {
+  const cleanName = normalizeStaffProfileName(STAFF_OWNER_PROFILE_NAME || "Sameer");
+  const fallback = getBuiltInAuthorityProfileRaw();
+  if (SUPABASE_ENABLED) {
+    try {
+      const rows = await dbSelect("app_settings", `select=setting_value,created_at,updated_at&setting_key=eq.${encodeEq(BUILT_IN_AUTHORITY_SETTING_KEY)}&limit=1`);
+      const row = Array.isArray(rows) && rows.length ? rows[0] : null;
+      const value = row?.setting_value && typeof row.setting_value === "object" ? row.setting_value : {};
+      return {
+        id: BUILT_IN_AUTHORITY_PROFILE_ID,
+        name: cleanName,
+        role: "owner",
+        canManageUsers: true,
+        password_hash: value.password_hash || null,
+        created_at: row?.created_at || value.created_at || fallback.createdAt || null,
+        updated_at: row?.updated_at || value.updated_at || fallback.updatedAt || null,
+      };
+    } catch (error) {
+      rememberSupabaseIssue("load built-in staff profile", error);
+    }
+  }
+  return fallback;
+}
+
+async function saveBuiltInAuthorityProfilePassword(password = "", actor = null) {
+  const cleanPassword = String(password || "");
+  if (cleanPassword.length < 4) throw new Error("Staff user password must be at least 4 characters.");
+  const cleanName = normalizeStaffProfileName(STAFF_OWNER_PROFILE_NAME || "Sameer");
+  const now = new Date().toISOString();
+  const passwordHash = encodeStaffProfilePassword(cleanPassword);
+
+  if (SUPABASE_ENABLED) {
+    try {
+      await dbUpsert("app_settings", [{
+        setting_key: BUILT_IN_AUTHORITY_SETTING_KEY,
+        setting_value: {
+          display_name: cleanName,
+          password_hash: passwordHash,
+          role: "owner",
+          updated_at: now,
+        },
+        updated_by_name: actor?.name || null,
+        updated_at: now,
+      }], { onConflict: "setting_key", returning: false });
+      return publicStaffProfile({
+        id: BUILT_IN_AUTHORITY_PROFILE_ID,
+        name: cleanName,
+        role: "owner",
+        canManageUsers: true,
+        password_hash: passwordHash,
+        updated_at: now,
+      }, { includePermissions: true });
+    } catch (error) {
+      rememberSupabaseIssue("save built-in staff profile", error);
+    }
+  }
+
+  return createOrUpdateStaffProfileFile({ name: cleanName, password: cleanPassword, role: "owner", requirePassword: true });
+}
+
 function isBuiltInAuthorityProfileId(id = "") {
-  return String(id || "") === "builtin-authority-profile";
+  return String(id || "") === BUILT_IN_AUTHORITY_PROFILE_ID;
 }
 
 function getFileStaffProfiles() {
@@ -407,7 +469,7 @@ async function getDbStaffProfiles({ includeInactive = false } = {}) {
   const statusFilter = includeInactive ? "" : "&status=eq.active";
   const rows = await dbSelect("staff_users", `select=*&order=created_at.asc${statusFilter}`);
   const profiles = [
-    publicStaffProfile(getBuiltInAuthorityProfileRaw()),
+    publicStaffProfile(await getBuiltInAuthorityProfileRecord()),
     ...(Array.isArray(rows) ? rows : [])
       .filter((row) => !isOwnerStaffProfileName(row?.display_name))
       .map((row) => publicStaffProfile(row)),
@@ -436,7 +498,7 @@ function findStoredStaffProfile(name = "") {
 async function findStaffProfileRecord(name = "") {
   const cleanName = normalizeStaffProfileName(name);
   if (!cleanName) return null;
-  if (isOwnerStaffProfileName(cleanName)) return getBuiltInAuthorityProfileRaw();
+  if (isOwnerStaffProfileName(cleanName)) return await getBuiltInAuthorityProfileRecord();
   if (SUPABASE_ENABLED) {
     try {
       await ensureDefaultStaffProfilesInDb();
@@ -491,7 +553,12 @@ async function createOrUpdateStaffProfile({ name, password, role = "staff", requ
   if (cleanPassword && cleanPassword.length < 4) throw new Error("Staff user password must be at least 4 characters.");
 
   if (isOwnerStaffProfileName(cleanName)) {
-    return createOrUpdateStaffProfileFile({ name: cleanName, password: cleanPassword, role: "owner", requirePassword });
+    if (cleanPassword) return await saveBuiltInAuthorityProfilePassword(cleanPassword, actor);
+    const existingBuiltIn = await getBuiltInAuthorityProfileRecord();
+    if (requirePassword && !existingBuiltIn?.password_hash && !(existingBuiltIn?.passwordHash && existingBuiltIn?.salt)) {
+      throw new Error("Staff user password must be at least 4 characters.");
+    }
+    return publicStaffProfile(existingBuiltIn, { includePermissions: true });
   }
 
   if (SUPABASE_ENABLED) {
