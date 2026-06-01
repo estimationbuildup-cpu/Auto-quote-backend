@@ -20,7 +20,8 @@ const STAFF_CONTACT_PHONE = process.env.SAMEER_CONTACT_PHONE || process.env.COMP
 const STAFF_EMAIL = String(process.env.STAFF_EMAIL || "").trim().toLowerCase();
 const STAFF_PASSWORD = process.env.STAFF_PASSWORD || "";
 const STAFF_USERS_JSON = process.env.STAFF_USERS_JSON || "";
-const STAFF_TOKEN_TTL_MS = Number(process.env.STAFF_TOKEN_TTL_HOURS || 12) * 60 * 60 * 1000;
+const STAFF_TOKEN_TTL_MS = Number(process.env.STAFF_TOKEN_TTL_HOURS || 168) * 60 * 60 * 1000;
+const STAFF_SESSION_SECRET = process.env.STAFF_SESSION_SECRET || crypto.createHash("sha256").update(`${STAFF_PASSWORD}|${STAFF_USERS_JSON}|buildup-staff-session-v2`).digest("hex");
 const staffSessions = new Map();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1410,6 +1411,38 @@ async function syncSnapshotBusinessData(snapshot = {}, req) {
   await upsertQuotesToSupabase(state.savedQuotes, leadMap, req);
 }
 
+
+function dbQuoteToAppQuote(row = {}) {
+  const quoteData = row.quote_data && typeof row.quote_data === "object" ? row.quote_data : {};
+  const quotation = quoteData.quotation && typeof quoteData.quotation === "object" ? quoteData.quotation : {};
+  return {
+    ...quoteData,
+    id: quoteData.id || row.id,
+    quoteNo: quoteData.quoteNo || row.quote_number || quotation.referenceNo,
+    leadId: quoteData.leadId || row.lead_public_id || quotation.leadId || "",
+    customerName: quoteData.customerName || row.client_name_snapshot || quotation.customerName || "",
+    quoteStatus: quoteData.quoteStatus || row.quote_status || row.status || "Draft",
+    saveAsStatus: quoteData.saveAsStatus || row.status || "Done.",
+    saveAsNote: quoteData.saveAsNote || row.notes || "",
+    subtotal: toNumberOrNull(quoteData.subtotal) || 0,
+    taxAmount: toNumberOrNull(quoteData.taxAmount || row.vat_amount) || 0,
+    finalTotal: toNumberOrNull(quoteData.finalTotal || row.final_amount || row.quotation_amount) || 0,
+    savedAt: quoteData.savedAt || row.created_at || row.updated_at || new Date().toISOString(),
+    updatedAt: row.updated_at || quoteData.updatedAt || new Date().toISOString(),
+    createdFrom: quoteData.createdFrom || row.created_from || "supabase",
+    source: "supabase",
+    quotation: {
+      ...quotation,
+      referenceNo: quotation.referenceNo || row.quote_number,
+      customerName: quotation.customerName || row.client_name_snapshot || quoteData.customerName || "",
+      quoteStatus: quotation.quoteStatus || row.quote_status || quoteData.quoteStatus || "Draft",
+      saveAsStatus: quotation.saveAsStatus || row.status || quoteData.saveAsStatus || "Done.",
+      saveAsNote: quotation.saveAsNote || row.notes || quoteData.saveAsNote || "",
+    },
+    rows: Array.isArray(quoteData.rows) ? quoteData.rows : [],
+  };
+}
+
 function getCustomerDisplayName(customer = {}) {
   return String(customer.name || customer.customerName || customer.clientName || customer.customer_name || "").trim();
 }
@@ -1937,17 +1970,58 @@ function cleanStaffSessions() {
   }
 }
 
+function base64UrlEncode(value) {
+  return Buffer.from(String(value)).toString("base64url");
+}
+
+function base64UrlJson(value) {
+  return Buffer.from(JSON.stringify(value)).toString("base64url");
+}
+
+function signStaffSessionPayload(payloadPart) {
+  return crypto.createHmac("sha256", STAFF_SESSION_SECRET).update(payloadPart).digest("base64url");
+}
+
 function createStaffToken(staffUser) {
   cleanStaffSessions();
-  const token = crypto.randomBytes(32).toString("hex");
-  staffSessions.set(token, {
+  const now = Date.now();
+  const payload = {
+    v: 2,
     role: staffUser?.role || "staff",
     email: staffUser?.email || "",
     name: staffUser?.name || staffUser?.email || "Staff",
-    createdAt: Date.now(),
-    expiresAt: Date.now() + STAFF_TOKEN_TTL_MS,
-  });
-  return token;
+    iat: now,
+    exp: now + STAFF_TOKEN_TTL_MS,
+  };
+  const payloadPart = base64UrlJson(payload);
+  const signature = signStaffSessionPayload(payloadPart);
+  return `v2.${payloadPart}.${signature}`;
+}
+
+function verifySignedStaffToken(token) {
+  const raw = String(token || "").trim();
+  if (!raw.startsWith("v2.")) return null;
+  const [, payloadPart, signature] = raw.split(".");
+  if (!payloadPart || !signature) return null;
+  const expected = signStaffSessionPayload(payloadPart);
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
+  } catch {
+    return null;
+  }
+  try {
+    const payload = JSON.parse(Buffer.from(payloadPart, "base64url").toString("utf8"));
+    if (!payload?.exp || Number(payload.exp) <= Date.now()) return null;
+    return {
+      role: payload.role || "staff",
+      email: payload.email || "",
+      name: payload.name || payload.email || "Staff",
+      createdAt: payload.iat || Date.now(),
+      expiresAt: payload.exp,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function getStaffToken(req) {
@@ -1959,7 +2033,7 @@ function getStaffToken(req) {
 function requireStaff(req, res, next) {
   cleanStaffSessions();
   const token = getStaffToken(req);
-  const session = token ? staffSessions.get(token) : null;
+  const session = token ? (staffSessions.get(token) || verifySignedStaffToken(token)) : null;
   if (!session) {
     return res.status(401).json({ success: false, ok: false, error: "Staff login required." });
   }
@@ -1991,6 +2065,7 @@ app.post("/staff-login", (req, res) => {
     ok: true,
     token,
     expiresInMs: STAFF_TOKEN_TTL_MS,
+    expiresAt: new Date(Date.now() + STAFF_TOKEN_TTL_MS).toISOString(),
     staff: { email: staffUser.email, name: staffUser.name, role: staffUser.role },
   });
 });
@@ -2251,6 +2326,77 @@ app.get("/db-health", requireStaff, async (req, res) => {
   }
 });
 
+
+app.get("/quotes", requireStaff, async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) {
+      return res.json({ ok: true, success: true, storage: "local-fallback", quotes: [] });
+    }
+    const limit = Math.min(Math.max(Number(req.query.limit || 300), 1), 500);
+    const rows = await dbSelect("quotes", `select=*,leads(lead_id)&order=updated_at.desc&limit=${limit}`);
+    const quotes = (Array.isArray(rows) ? rows : []).map((row) => dbQuoteToAppQuote({ ...row, lead_public_id: row.leads?.lead_id || "" }));
+    res.json({ ok: true, success: true, storage: "supabase", quotes });
+  } catch (error) {
+    rememberSupabaseIssue("load quotes", error);
+    res.status(500).json({ ok: false, success: false, error: error.message || "Could not load cloud quotes." });
+  }
+});
+
+app.post("/quotes/upsert", requireStaff, async (req, res) => {
+  try {
+    const quote = req.body?.quote || req.body || {};
+    const quoteNumber = quote.quoteNo || quote.quotation?.referenceNo || quote.autoDraftNo;
+    if (!quoteNumber) return res.status(400).json({ ok: false, success: false, error: "Quote number is required before saving to cloud." });
+    if (!SUPABASE_ENABLED) return res.status(500).json({ ok: false, success: false, error: "Supabase is not configured." });
+
+    let leadUuid = null;
+    if (quote.leadId) {
+      const existingLead = await dbSelect("leads", `select=id&lead_id=eq.${encodeEq(quote.leadId)}&limit=1`);
+      leadUuid = Array.isArray(existingLead) && existingLead[0]?.id ? existingLead[0].id : null;
+    }
+
+    const actor = actorFromRequest(req);
+    const previousRows = await dbSelect("quotes", `select=id,quote_data&quote_number=eq.${encodeEq(quoteNumber)}&limit=1`);
+    const previous = Array.isArray(previousRows) && previousRows.length ? previousRows[0] : null;
+    const payload = normalizeQuoteDbPayload({ ...quote, quoteNo: quoteNumber }, leadUuid, actor);
+    const savedRows = await dbUpsert("quotes", [payload], { onConflict: "quote_number" });
+    const saved = Array.isArray(savedRows) && savedRows[0] ? savedRows[0] : null;
+    if (!saved?.id) throw new Error("Quote was not returned from Supabase.");
+
+    await dbDelete("quote_items", `quote_id=eq.${encodeEq(saved.id)}`, { returning: false });
+    if (Array.isArray(quote.rows) && quote.rows.length) {
+      await dbInsert("quote_items", quote.rows.map((item) => normalizeQuoteItemDbPayload(item, saved.id, actor)), { returning: false });
+    }
+
+    if (stableStringify(previous?.quote_data || null) !== stableStringify(quote || null)) {
+      await dbInsert("quote_versions", [{
+        quote_id: saved.id,
+        quote_number: quoteNumber,
+        version_number: await nextQuoteVersionNumber(saved.id),
+        saved_by: actor.id,
+        saved_by_name: actor.name,
+        reason: previous ? "quote_updated_from_quote_maker" : "quote_created_from_quote_maker",
+        quote_snapshot: quote,
+      }], { returning: false });
+      await writeAuditLog(req, {
+        action_type: previous ? "quote_cloud_updated" : "quote_cloud_created",
+        module: "quotes",
+        target_table: "quotes",
+        target_id: saved.id,
+        quote_number: quoteNumber,
+        old_snapshot: previous?.quote_data || null,
+        new_snapshot: quote,
+        change_summary: `${actor.name} ${previous ? "updated" : "created"} quote ${quoteNumber} in Supabase.`,
+      });
+    }
+
+    res.json({ ok: true, success: true, storage: "supabase", quote: dbQuoteToAppQuote(saved) });
+  } catch (error) {
+    rememberSupabaseIssue("upsert quote", error);
+    res.status(500).json({ ok: false, success: false, error: error.message || "Could not save quote to cloud." });
+  }
+});
+
 app.get("/audit-logs", requireStaff, async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 300);
   if (!SUPABASE_ENABLED) {
@@ -2340,7 +2486,11 @@ app.get("/customer-chat-session/:chatId", async (req, res) => {
     if (!chatId) return res.status(400).json({ ok: false, success: false, error: "Missing chat session." });
     const rows = await loadCustomerRequestRows(300);
     const match = dedupeCustomerRequests(rows).find((row) => String(row?.estimate_data?.chatId || row?.id || "") === chatId || String(row?.id || "") === chatId);
-    if (!match) return res.status(404).json({ ok: false, success: false, error: "Chat session not found." });
+    // A new customer chat may not have been saved to the database yet. Do not return 404 here,
+    // because the frontend polls this endpoint and browser consoles show repeated red errors.
+    // Returning 200 with request:null keeps polling quiet until the chat is actually registered
+    // by a quote submission, location upload, document upload, or real-agent request.
+    if (!match) return res.json({ ok: true, success: true, request: null, notFound: true });
     res.json({ ok: true, success: true, request: match });
   } catch (error) {
     rememberSupabaseIssue("customer chat session load", error);
