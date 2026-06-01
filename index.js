@@ -42,6 +42,15 @@ const ASSISTANT_DISABLE_PHRASE = String(process.env.ASSISTANT_DISABLE_PHRASE || 
 const ASSISTANT_ENABLE_PHRASE = String(process.env.ASSISTANT_ENABLE_PHRASE || process.env.AI_ENABLE_PHRASE || "").trim();
 const ASSISTANT_CONTROL_STATUS_KEY = "assistant_global_control";
 const ASSISTANT_DISABLED_MESSAGE = process.env.ASSISTANT_DISABLED_MESSAGE || "Auto quote support is temporarily unavailable. Please share your name, phone number, location, and requirement. Our team will review it and get back to you.";
+const CUSTOMER_SPAM_GUARD_KEY = "customer_spam_guard";
+const CUSTOMER_CHAT_MESSAGE_LIMIT = Number(process.env.CUSTOMER_CHAT_MESSAGE_LIMIT || 30);
+const CUSTOMER_RAPID_MESSAGE_LIMIT = Number(process.env.CUSTOMER_RAPID_MESSAGE_LIMIT || 8);
+const CUSTOMER_RAPID_WINDOW_MS = Number(process.env.CUSTOMER_RAPID_WINDOW_MS || 60 * 1000);
+const CUSTOMER_SPAM_BASE_BLOCK_MS = Number(process.env.CUSTOMER_SPAM_BASE_BLOCK_MINUTES || 15) * 60 * 1000;
+const CUSTOMER_SPAM_MAX_BLOCK_MS = Number(process.env.CUSTOMER_SPAM_MAX_BLOCK_HOURS || 24) * 60 * 60 * 1000;
+const CUSTOMER_SPAM_MESSAGE = process.env.CUSTOMER_SPAM_MESSAGE || "Please try again later. Your account has been marked as spam for now.";
+const CUSTOMER_SPAM_MIN_GENUINE_SCORE = Number(process.env.CUSTOMER_SPAM_MIN_GENUINE_SCORE || 3);
+const CUSTOMER_SPAM_LONG_INQUIRY_MIN_CHARS = Number(process.env.CUSTOMER_SPAM_LONG_INQUIRY_MIN_CHARS || 90);
 let latestSupabaseIssue = null;
 
 function rememberSupabaseIssue(context, error) {
@@ -852,6 +861,70 @@ function normalizeQuoteItems(items = []) {
   });
 }
 
+
+function itemLabelForMissingDetails(item = {}, index = 0) {
+  return String(item.tag || item.code || item.item_code || item.subcategory || item.system || item.product || `item ${index + 1}`);
+}
+
+function textHasFenceLength(text = "") {
+  const value = String(text || "").toLowerCase();
+  return /(length|total|running|linear|meter|metre|mtr|rm|r\.m|feet|foot|ft)\s*(is|around|approx|approximately|=|:)?\s*\d+(\.\d+)?\s*(m|meter|metre|mtr|mm|cm|ft|feet|foot)?/i.test(value)
+    || /\d+(\.\d+)?\s*(m|meter|metre|mtr|ft|feet|foot)\s*(long|length|total|fenc|fencing|fence)/i.test(value)
+    || /(fenc|fencing|fence).{0,60}\d+(\.\d+)?\s*(m|meter|metre|mtr|ft|feet|foot)/i.test(value);
+}
+
+function textHasFenceHeight(text = "") {
+  const value = String(text || "").toLowerCase();
+  return /(height|high|ht)\s*(is|around|approx|approximately|=|:)?\s*\d+(\.\d+)?\s*(m|meter|metre|mtr|mm|cm|ft|feet|foot)?/i.test(value)
+    || /\d+(\.\d+)?\s*(m|meter|metre|mtr|mm|cm|ft|feet|foot)\s*(height|high|ht)/i.test(value);
+}
+
+function plausibleFenceLength(value) {
+  const n = Number(value || 0) || 0;
+  return (n >= 1000 && n <= 250000) || (n >= 1 && n <= 250);
+}
+
+function plausibleFenceHeight(value) {
+  const n = Number(value || 0) || 0;
+  return (n >= 400 && n <= 6000) || (n >= 0.4 && n <= 6);
+}
+
+function quoteMissingDetailLabelsForItems(items = [], customer = {}, messages = []) {
+  const list = Array.isArray(items) ? items : [];
+  const allText = `${customer?.projectType || ""} ${conversationText(messages)} ${list.map((item) => `${item.product || ""} ${item.type || ""} ${item.subcategory || ""} ${item.system || ""}`).join(" ")}`.toLowerCase();
+  const missing = [];
+
+  if (!list.length && !/fencing|fence|sliding|folding|hinged|door|window|fixed|glass|partition|shower|curtain|facade|skylight|pergola/.test(allText)) {
+    missing.push("product type");
+  }
+
+  list.forEach((item, index) => {
+    const label = `${item.product || ""} ${item.type || ""} ${item.subcategory || ""} ${item.system || ""}`.toLowerCase();
+    const display = itemLabelForMissingDetails(item, index);
+    const width = Number(item.width_mm ?? item.width ?? item.widthMm ?? 0) || 0;
+    const height = Number(item.height_mm ?? item.height ?? item.heightMm ?? 0) || 0;
+    const qty = Number(item.qty ?? item.quantity ?? 0) || 0;
+    const isFencing = /fenc|fencing|fence/.test(label) || /fenc|fencing|fence/.test(allText);
+
+    if (isFencing) {
+      if (!plausibleFenceLength(width) && !textHasFenceLength(allText)) missing.push(`approximate total length for ${display}`);
+      if (!plausibleFenceHeight(height) && !textHasFenceHeight(allText)) missing.push(`height for ${display}`);
+    } else {
+      if (width <= 0) missing.push(`width/opening size for ${display}`);
+      if (height <= 0) missing.push(`height for ${display}`);
+    }
+    if (qty <= 0) missing.push(`quantity for ${display}`);
+  });
+
+  return [...new Set(missing)].slice(0, 6);
+}
+
+function quoteMissingQuestion(missing = []) {
+  const first = missing.slice(0, 3).join(", ");
+  if (!first) return "Can you share the product type, approximate size and quantity?";
+  return `Can you share the ${first}${missing.length > 3 ? " and remaining details" : ""}?`;
+}
+
 function buildSystemPrompt(mode) {
   const common = `
 You are Buildup UAE's aluminium, glass, window and door quotation assistant.
@@ -869,11 +942,20 @@ Core behavior:
 
 Conversation order for customer mode:
 1. Understand product type first.
-2. Then ask for product size / approximate opening size.
-3. Then ask for location.
-4. Then ask for name and phone number before final submission.
-Customers may start chatting without name/phone/location. Extract them from chat if mentioned and return them in customer_updates.
+2. Collect quote-critical product details BEFORE confirmation, price, or staff submission.
+   - Doors/windows/fixed glass: width/opening and height, plus quantity.
+   - Aluminium fencing/fence: approximate total length and height. Do NOT treat a phone number as a length. Do NOT submit fencing to staff just because phone/location was provided.
+   - Partitions/shower/railing: approximate width/length and height, plus quantity/area if available.
+3. When quote-critical details are complete, summarize the products and ask for confirmation. Confirmation should be the final step before price/staff-review.
+4. After customer confirms:
+   - If standard configuration: return quote_draft so the app can show instant price.
+   - If non-standard/custom options are selected, return quote_draft but clearly note it needs staff review. Non-standard includes frosted/fluted/tinted/reflective glass, special glass colour, non-standard thickness, special aluminium/frame colour, jumbo/special access, or unclear specifications.
+5. After quotation/review submission, ask for Google Maps location if not already shared.
+6. After location is shared, ask whether they want to book a site visit with an expert.
+Customers may start chatting without name/phone/location. Extract them from chat if mentioned and return them in customer_updates, but do not block instant standard price just because name/phone/location is missing.
 Do not ask for name, phone, location, size, product type, glass, and panels all in one message.
+Do not ask for Google Maps location twice. If a location or location request already exists in the conversation, continue with the missing product detail or site-visit question instead.
+Do not submit to staff or return quote_draft until quote-critical size details are present.
 
 Expert guidance examples:
 - For a 5m / 5000mm opening, hinged or pivot is usually not practical as the first recommendation.
@@ -892,9 +974,10 @@ Smart sliding panel default:
 - 6 total panels = 4 sliding + 2 fixed
 
 Before creating a draft from customer chat:
-- Detect possible items, but ask the customer to confirm first.
-- Use mode "confirm_draft" and requires_confirmation true when items are detected but customer has not confirmed.
+- Detect possible items, but ask the customer to confirm first only when all quote-critical details are complete.
+- Use mode "confirm_draft" and requires_confirmation true when items are ready but customer has not confirmed.
 - If the customer confirms the summarized details, return mode "quote_draft".
+- Do not show confirmation buttons early. Confirmation means the next step is price for standard items or staff review for non-standard items.
 
 Supported item fields:
 - tag: drawing/code like SD1, D1, FG1, W1
@@ -934,6 +1017,7 @@ Do not ask all questions at once. Ask the next 1-3 useful questions only.
 If the customer asks a general advice question like "sliding or folding", answer with simple pros/cons from your own knowledge and the company catalog. Do not say you searched or asked ChatGPT.
 Example: If customer says "Doors" and asks what kinds: reply only with the door options, such as "We have Slim Sliding Doors, Folding Doors and Hinged Doors. Which one do you prefer?" Do NOT also ask size, name, phone and location in that same message.
 If enough details exist, summarize and confirm: "Just to confirm, you need ... correct?"
+Confirmation should appear only after all important product details are complete. After confirmation, the app will either price standard configurations or transparently send non-standard/custom configurations to staff review.
 Never jump straight to quote_draft in customer mode unless the customer's latest message clearly confirms the summary.`;
   }
 
@@ -1022,6 +1106,16 @@ function postProcessResult(parsed = {}, { mode, prompt, messages, customer }) {
   };
 
   if (mode === "customer" && items.length) {
+    const missingQuoteDetails = quoteMissingDetailLabelsForItems(items, mergedCustomer, messages);
+    if (missingQuoteDetails.length) {
+      next.mode = "need_clarification";
+      next.requires_confirmation = false;
+      next.items = [];
+      next.questions = [quoteMissingQuestion(missingQuoteDetails)];
+      next.missing_required_fields = [...new Set([...(next.missing_required_fields || []), ...missingQuoteDetails])];
+      next.reply = quoteMissingQuestion(missingQuoteDetails);
+      return next;
+    }
     const alreadyConfirmed = isPositiveConfirmation(lastText) || parsed.confirmed_by_customer === true || parsed.mode === "quote_draft";
     if (!alreadyConfirmed) {
       const summary = next.confirmation_summary || items.map((item, index) => {
@@ -2527,6 +2621,163 @@ app.post("/agent-request", async (req, res) => {
   res.json({ success: true, request, staffContactName: STAFF_CONTACT_NAME, staffContactPhone: STAFF_CONTACT_PHONE });
 });
 
+
+async function readCustomerSpamGuard() {
+  const fallback = { clients: {} };
+  if (SUPABASE_ENABLED) {
+    try {
+      const rows = await dbSelect("app_settings", `select=setting_value&setting_key=eq.${CUSTOMER_SPAM_GUARD_KEY}&limit=1`);
+      const value = rows?.[0]?.setting_value;
+      if (value && typeof value === "object") return { clients: value.clients || {} };
+    } catch (error) {
+      rememberSupabaseIssue("customer spam guard read", error);
+    }
+  }
+  return readJsonFile(path.join(DATA_DIR, "customer-spam-guard.json"), fallback);
+}
+
+async function writeCustomerSpamGuard(data = {}) {
+  const value = { clients: data.clients || {} };
+  writeJsonFile(path.join(DATA_DIR, "customer-spam-guard.json"), value);
+  if (SUPABASE_ENABLED) {
+    try {
+      await dbUpsert("app_settings", [{
+        setting_key: CUSTOMER_SPAM_GUARD_KEY,
+        setting_value: value,
+        updated_by_name: "System",
+        updated_at: new Date().toISOString(),
+      }], { onConflict: "setting_key" });
+    } catch (error) {
+      rememberSupabaseIssue("customer spam guard write", error);
+    }
+  }
+}
+
+function customerSpamKey(req, chatId = "") {
+  const ip = String(req?.headers?.["x-forwarded-for"] || req?.ip || "unknown").split(",")[0].trim();
+  const chat = String(chatId || "unknown-chat").slice(0, 80);
+  return crypto.createHash("sha256").update(`${ip}|${chat}`).digest("hex");
+}
+
+function userMessagesFromConversation(messages = [], prompt = "") {
+  const list = Array.isArray(messages) ? messages : [];
+  const out = list.filter((m) => normalizeRole(m.role) === "user").map((m) => ({ text: normalizeContent(m.content || m.text), at: m.at || m.created_at || null }));
+  const last = normalizeContent(prompt).trim();
+  if (last && !out.some((m) => m.text === last)) out.push({ text: last, at: new Date().toISOString() });
+  return out;
+}
+
+function messageHasQuoteSignal(text = "") {
+  return /\b(door|window|glass|sliding|folding|hinged|fixed|partition|shower|fencing|fence|gate|railing|pergola|facade|curtain|skylight|aluminium|aluminum|mm|cm|meter|metre|mtr|feet|foot|ft|x|size|height|width|length|qty|quantity|dubai|sharjah|ajman|abu dhabi|location|phone|mobile|whatsapp|05\d|\+971|quote|price|quotation|villa|office|warehouse|site)\b/i.test(String(text || ""));
+}
+
+function messageQualitySignals(text = "") {
+  const value = String(text || "").toLowerCase();
+  const signals = {
+    longEnough: value.trim().length >= CUSTOMER_SPAM_LONG_INQUIRY_MIN_CHARS,
+    product: /\b(door|window|glass|sliding|folding|hinged|fixed|partition|shower|fencing|fence|gate|railing|pergola|facade|curtain|skylight|aluminium|aluminum)\b/i.test(value),
+    measurement: /\b(\d+(?:\.\d+)?\s*(?:mm|cm|m|meter|metre|mtr|ft|feet|foot)|\d+\s*[x×]\s*\d+|width|height|length|size|qty|quantity)\b/i.test(value),
+    contact: /(?:\+?971|0)?5\d[\s-]?\d{3}[\s-]?\d{4}|\bphone\b|\bmobile\b|\bwhatsapp\b/i.test(value),
+    location: /\b(dubai|sharjah|ajman|abu dhabi|rak|ras al khaimah|umm al quwain|fujairah|al quoz|jvc|jlt|marina|maps?|location|site|villa|warehouse)\b/i.test(value),
+    intent: /\b(quote|quotation|price|cost|estimate|need|want|required|looking for|install|supply)\b/i.test(value),
+    document: /\b(pdf|drawing|schedule|photo|image|picture|attachment|upload)\b/i.test(value),
+  };
+  return signals;
+}
+
+function genuineInquiryScore(messages = [], prompt = "") {
+  const texts = [...(Array.isArray(messages) ? messages : []).map((m) => normalizeContent(m.content || m.text)), normalizeContent(prompt)]
+    .filter(Boolean);
+  const combined = texts.slice(-10).join(" ");
+  const latest = normalizeContent(prompt);
+  const combinedSignals = messageQualitySignals(combined);
+  const latestSignals = messageQualitySignals(latest);
+  let score = 0;
+  for (const key of Object.keys(combinedSignals)) if (combinedSignals[key]) score += 1;
+  if (latestSignals.longEnough && (latestSignals.product || latestSignals.measurement || latestSignals.contact || latestSignals.location)) score += 2;
+  return { score, combinedSignals, latestSignals, latestLength: latest.trim().length };
+}
+
+function isClearlyLowValueMessage(text = "") {
+  const t = String(text || "").trim();
+  if (!t) return true;
+  if (messageHasQuoteSignal(t)) return false;
+  if (t.length >= 25) return false;
+  return /^(hi+|hey+|hello+|test+|ok+|okay+|yo+|hmm+|yes+|no+|\?+|\.+|,+|lol+)$/i.test(t) || t.length <= 8;
+}
+
+async function evaluateCustomerSpamGuard(req, { prompt = "", messages = [], chatId = "" } = {}) {
+  const now = Date.now();
+  const key = customerSpamKey(req, chatId);
+  const data = await readCustomerSpamGuard();
+  const clients = data.clients || {};
+  const current = clients[key] || { violations: 0, blockedUntil: 0, events: [] };
+
+  const quality = genuineInquiryScore(messages, prompt);
+  const isGenuineInquiry = quality.score >= CUSTOMER_SPAM_MIN_GENUINE_SCORE;
+
+  if (Number(current.blockedUntil || 0) > now) {
+    // A real detailed quote inquiry should not stay trapped behind an earlier spam score.
+    // Example: a customer first typed "hi hi hi", then sends a full product/size/location inquiry.
+    if (isGenuineInquiry) {
+      clients[key] = {
+        ...current,
+        blockedUntil: 0,
+        violations: Math.max(0, Number(current.violations || 0) - 1),
+        lastReason: "cleared_by_genuine_inquiry",
+        lastSeenAt: now,
+      };
+      await writeCustomerSpamGuard({ clients });
+    } else {
+      return { blocked: true, message: CUSTOMER_SPAM_MESSAGE, blockedUntil: current.blockedUntil };
+    }
+  }
+
+  const userMessages = userMessagesFromConversation(messages, prompt);
+  const recentEvents = (current.events || []).filter((event) => now - Number(event.at || 0) < 10 * 60 * 1000);
+  recentEvents.push({ at: now, text: normalizeContent(prompt).trim() });
+
+  const recentRapid = recentEvents.filter((event) => now - Number(event.at || 0) <= CUSTOMER_RAPID_WINDOW_MS).length;
+  const recentLowValue = recentEvents.filter((event) => isClearlyLowValueMessage(event.text)).length;
+  const lowValueTotal = userMessages.filter((event) => isClearlyLowValueMessage(event.text)).length;
+  const usefulTotal = userMessages.length - lowValueTotal;
+
+  let violationReason = "";
+  if (!isGenuineInquiry) {
+    if (userMessages.length > CUSTOMER_CHAT_MESSAGE_LIMIT && usefulTotal < 4) violationReason = "message_limit_low_value";
+    else if (recentRapid > CUSTOMER_RAPID_MESSAGE_LIMIT && recentLowValue >= Math.max(5, CUSTOMER_RAPID_MESSAGE_LIMIT - 2)) violationReason = "rapid_low_value_messages";
+    else if (recentLowValue >= 6 && lowValueTotal >= 8 && usefulTotal < 3) violationReason = "low_value_repeated_messages";
+  }
+
+  if (!violationReason) {
+    clients[key] = {
+      ...current,
+      events: recentEvents.slice(-80),
+      lastSeenAt: now,
+      lastQualityScore: quality.score,
+      lastGenuineInquiry: isGenuineInquiry,
+    };
+    await writeCustomerSpamGuard({ clients });
+    return { blocked: false };
+  }
+
+  const violations = Number(current.violations || 0) + 1;
+  const blockMs = Math.min(CUSTOMER_SPAM_BASE_BLOCK_MS * Math.pow(2, Math.max(0, violations - 1)), CUSTOMER_SPAM_MAX_BLOCK_MS);
+  const blockedUntil = now + blockMs;
+  clients[key] = {
+    ...current,
+    violations,
+    blockedUntil,
+    lastReason: violationReason,
+    events: recentEvents.slice(-80),
+    lastSeenAt: now,
+    lastQualityScore: quality.score,
+    lastGenuineInquiry: isGenuineInquiry,
+  };
+  await writeCustomerSpamGuard({ clients });
+  return { blocked: true, message: CUSTOMER_SPAM_MESSAGE, blockedUntil, reason: violationReason };
+}
+
 app.post("/ai-estimate", async (req, res) => {
   try {
     if (!process.env.OPENAI_API_KEY) {
@@ -2568,6 +2819,18 @@ app.post("/ai-estimate", async (req, res) => {
           assistantDisabled: true,
           reply: ASSISTANT_DISABLED_MESSAGE,
           result: { reply: ASSISTANT_DISABLED_MESSAGE, mode: "assistant_disabled", questions: [] },
+        });
+      }
+    }
+
+    if (mode === "customer") {
+      const spamCheck = await evaluateCustomerSpamGuard(req, { prompt, messages, chatId: req.body?.chatId || req.body?.id || "" });
+      if (spamCheck.blocked) {
+        return res.json({
+          success: true,
+          spamBlocked: true,
+          reply: spamCheck.message,
+          result: { reply: spamCheck.message, mode: "spam_blocked", questions: [] },
         });
       }
     }
