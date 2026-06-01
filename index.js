@@ -1572,13 +1572,21 @@ function dedupeCustomerRequests(rows = []) {
 
 function notificationSectionsFromRequests(rows = []) {
   const deduped = dedupeCustomerRequests(rows);
-  const statusOf = (row) => String(row?.status || row?.estimate_data?.eventType || "").toLowerCase();
+  const statusOf = (row) => String(row?.status || row?.estimate_data?.eventType || row?.estimate_data?.sessionStatus || "").toLowerCase();
+  const isHistory = (row) => {
+    const status = statusOf(row);
+    return status.includes("handled") || status.includes("contacted") || status.includes("session_closed") || status.includes("closed") || row?.estimate_data?.handledAt;
+  };
+  const active = deduped.filter((row) => !isHistory(row));
+  const history = deduped.filter(isHistory);
   return {
     all: deduped,
-    realAgent: deduped.filter((row) => { const status = statusOf(row); return status.includes("agent") || status.includes("staff_active") || status.includes("customer_waiting_staff"); }),
-    aiSubmitted: deduped.filter((row) => statusOf(row).includes("submitted")),
-    needsReview: deduped.filter((row) => statusOf(row).includes("review")),
-    locationSiteWork: deduped.filter((row) => {
+    active,
+    history,
+    realAgent: active.filter((row) => { const status = statusOf(row); return status.includes("agent") || status.includes("staff_active") || status.includes("customer_waiting_staff"); }),
+    aiSubmitted: active.filter((row) => statusOf(row).includes("submitted")),
+    needsReview: active.filter((row) => statusOf(row).includes("review")),
+    locationSiteWork: active.filter((row) => {
       const status = statusOf(row);
       return status.includes("location") || status.includes("site_visit") || status.includes("document") || Boolean(row.location || row?.estimate_data?.locationLink || row?.estimate_data?.siteVisit);
     }),
@@ -2409,7 +2417,8 @@ app.post("/customer-chat-session-status", requireStaff, async (req, res) => {
         chatId,
         staffControl: status === "staff_active",
         sessionStatus: status,
-        closedAt: status === "session_closed" ? new Date().toISOString() : previous?.estimate_data?.closedAt || null,
+        closedAt: (status === "session_closed" || status === "handled" || status === "contacted") ? new Date().toISOString() : previous?.estimate_data?.closedAt || null,
+        handledAt: (status === "handled" || status === "contacted" || status === "session_closed") ? new Date().toISOString() : previous?.estimate_data?.handledAt || null,
       },
     }, req);
     res.json({ ok: true, success: true, request: row });
