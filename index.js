@@ -908,10 +908,10 @@ function quoteMissingDetailLabelsForItems(items = [], customer = {}, messages = 
     const isFencing = /fenc|fencing|fence/.test(label) || /fenc|fencing|fence/.test(allText);
 
     if (isFencing) {
-      if (!plausibleFenceLength(width) && !textHasFenceLength(allText)) missing.push(`approximate total length for ${display}`);
+      if (!plausibleFenceLength(width) && !textHasFenceLength(allText)) missing.push(`width for ${display}`);
       if (!plausibleFenceHeight(height) && !textHasFenceHeight(allText)) missing.push(`height for ${display}`);
     } else {
-      if (width <= 0) missing.push(`width/opening size for ${display}`);
+      if (width <= 0) missing.push(`width for ${display}`);
       if (height <= 0) missing.push(`height for ${display}`);
     }
     if (qty <= 0) missing.push(`quantity for ${display}`);
@@ -920,10 +920,34 @@ function quoteMissingDetailLabelsForItems(items = [], customer = {}, messages = 
   return [...new Set(missing)].slice(0, 6);
 }
 
+function sanitizeCustomerFacingMeasurementText(text = "") {
+  return String(text || "")
+    .replace(/width\s*\/\s*length/gi, "width")
+    .replace(/length\s*\/\s*width/gi, "width")
+    .replace(/approximate\s+total\s+length/gi, "width")
+    .replace(/total\s+length/gi, "width")
+    .replace(/running\s+length/gi, "width")
+    .replace(/linear\s+meter(?:s)?/gi, "width")
+    .replace(/\blength\b/gi, "width")
+    .replace(/width\s*\/\s*opening\s+size/gi, "width")
+    .replace(/opening\s+size/gi, "width and height")
+    .replace(/approximate\s+size/gi, "width and height")
+    .replace(/\bsize\s+details\b/gi, "width and height details")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 function quoteMissingQuestion(missing = []) {
   const first = missing.slice(0, 3).join(", ");
-  if (!first) return "Can you share the product type, approximate size and quantity?";
-  return `Can you share the ${first}${missing.length > 3 ? " and remaining details" : ""}?`;
+  if (!first) return "Can you share the product type, width, height and quantity?";
+  const cleanFirst = sanitizeCustomerFacingMeasurementText(first);
+  const options = [
+    `Can you share the ${cleanFirst}${missing.length > 3 ? " and remaining details" : ""}?`,
+    `Please send the ${cleanFirst}${missing.length > 3 ? " and the remaining quote details" : ""} so I can continue.`,
+    `Got it. I just need the ${cleanFirst}${missing.length > 3 ? " plus the remaining details" : ""} to prepare this properly.`,
+    `For accurate pricing, please share the ${cleanFirst}${missing.length > 3 ? " and remaining details" : ""}.`,
+  ];
+  return options[Math.floor(Math.random() * options.length)];
 }
 
 function buildSystemPrompt(mode) {
@@ -935,6 +959,7 @@ Core behavior:
 - Be a professional, warm UAE sales assistant, not a rigid form.
 - Customer questions are priority. Answer their question first, then ask ONE short next question only if needed.
 - Sound natural: acknowledge first when useful ("I understand", "That makes sense", "For that opening...").
+- Vary your wording. Do not reuse the exact same sentence template for follow-up questions. Rotate naturally between short WhatsApp-style questions, helpful confirmations, and direct detail requests.
 - Do NOT repeat the same question again and again. If already asked, continue from the customer's latest answer.
 - Use the conversation history. Continue naturally and remember what the customer already answered.
 - Do not overwhelm the customer with a list of many fields in one message.
@@ -944,9 +969,9 @@ Core behavior:
 Conversation order for customer mode:
 1. Understand product type first.
 2. Collect quote-critical product details BEFORE confirmation, price, or staff submission.
-   - Doors/windows/fixed glass: width/opening and height, plus quantity.
-   - Aluminium fencing/fence: approximate total length and height. Do NOT treat a phone number as a length. Do NOT submit fencing to staff just because phone/location was provided.
-   - Partitions/shower/railing: approximate width/length and height, plus quantity/area if available.
+   - Doors/windows/fixed glass: width and height, plus quantity.
+   - Aluminium fencing/fence: width and height, plus quantity if there are separate sections. Do NOT treat a phone number as a width or height. Do NOT submit fencing to staff just because phone/location was provided.
+   - Partitions/shower/railing: width and height, plus quantity/area if available.
 3. When quote-critical details are complete, summarize the products and ask for confirmation. Confirmation should be the final step before price/staff-review.
 4. After customer confirms:
    - If standard configuration: return quote_draft so the app can show instant price.
@@ -954,9 +979,9 @@ Conversation order for customer mode:
 5. After quotation/review submission, ask for Google Maps location if not already shared.
 6. After location is shared, ask whether they want to book a site visit with an expert.
 Customers may start chatting without name/phone/location. Extract them from chat if mentioned and return them in customer_updates, but do not block instant standard price just because name/phone/location is missing.
-Do not ask for name, phone, location, size, product type, glass, and panels all in one message.
+Do not ask for name, phone, location, width, height, product type, glass, and panels all in one message.
 Do not ask for Google Maps location twice. If a location or location request already exists in the conversation, continue with the missing product detail or site-visit question instead.
-Do not submit to staff or return quote_draft until quote-critical size details are present.
+Do not submit to staff or return quote_draft until quote-critical width and height details are present.
 
 Expert guidance examples:
 - For a 5m / 5000mm opening, hinged or pivot is usually not practical as the first recommendation.
@@ -1014,12 +1039,13 @@ Use warm, short, professional WhatsApp-style language.
 Do not reveal internal pricing/catalog settings.
 Use web/search support when the customer asks about current suitability, comparisons, options, standards, or product guidance.
 Do not say "I don't know" to customers; for uncertain company-specific items, say "I will check with the team" and offer staff support.
-Do not ask all questions at once. Ask the next 1-3 useful questions only.
+Do not ask all questions at once. Ask the next 1-3 useful questions only, and vary the wording each time so it does not feel robotic.
 If the customer asks a general advice question like "sliding or folding", answer with simple pros/cons from your own knowledge and the company catalog. Do not say you searched or asked ChatGPT.
 Example: If customer says "Doors" and asks what kinds: reply only with the door options, such as "We have Slim Sliding Doors, Folding Doors and Hinged Doors. Which one do you prefer?" Do NOT also ask size, name, phone and location in that same message.
 If enough details exist, summarize and confirm: "Just to confirm, you need ... correct?"
 Confirmation should appear only after all important product details are complete. After confirmation, the app will either price standard configurations or transparently send non-standard/custom configurations to staff review.
-Never jump straight to quote_draft in customer mode unless the customer's latest message clearly confirms the summary.`;
+Never jump straight to quote_draft in customer mode unless the customer's latest message clearly confirms the summary.
+Customer-facing measurement language must ask only for "width and height". Do not use alternative measurement wording.`;
   }
 
   return `${common}
@@ -1112,9 +1138,15 @@ function postProcessResult(parsed = {}, { mode, prompt, messages, customer }) {
       next.mode = "need_clarification";
       next.requires_confirmation = false;
       next.items = [];
-      next.questions = [quoteMissingQuestion(missingQuoteDetails)];
-      next.missing_required_fields = [...new Set([...(next.missing_required_fields || []), ...missingQuoteDetails])];
-      next.reply = quoteMissingQuestion(missingQuoteDetails);
+      const followUpQuestion = quoteMissingQuestion(missingQuoteDetails);
+      next.questions = [followUpQuestion];
+      next.missing_required_fields = [...new Set([...(next.missing_required_fields || []), ...missingQuoteDetails.map(sanitizeCustomerFacingMeasurementText)])];
+      next.reply = followUpQuestion;
+      if (mode === "customer") {
+        if (typeof next.reply === "string") next.reply = sanitizeCustomerFacingMeasurementText(next.reply);
+        if (Array.isArray(next.questions)) next.questions = next.questions.map(sanitizeCustomerFacingMeasurementText);
+        if (Array.isArray(next.missing_required_fields)) next.missing_required_fields = next.missing_required_fields.map(sanitizeCustomerFacingMeasurementText);
+      }
       return next;
     }
     const alreadyConfirmed = isPositiveConfirmation(lastText) || parsed.confirmed_by_customer === true || parsed.mode === "quote_draft";
@@ -1142,8 +1174,15 @@ function postProcessResult(parsed = {}, { mode, prompt, messages, customer }) {
     } else if (missingRequired.length && mode === "customer") {
       next.reply = `Sure, I can help. Before staff prepares the quote, please share your ${missingRequired.join(", ")}.`;
     } else {
-      next.reply = "Sure, I understand. Can you share the size and quantity so I can prepare a draft?";
+      next.reply = "Sure, I understand. Please share the width, height and quantity so I can prepare a draft.";
     }
+  }
+
+  if (mode === "customer") {
+    if (typeof next.reply === "string") next.reply = sanitizeCustomerFacingMeasurementText(next.reply);
+    if (typeof next.confirmation_summary === "string") next.confirmation_summary = sanitizeCustomerFacingMeasurementText(next.confirmation_summary);
+    if (Array.isArray(next.questions)) next.questions = next.questions.map(sanitizeCustomerFacingMeasurementText);
+    if (Array.isArray(next.missing_required_fields)) next.missing_required_fields = next.missing_required_fields.map(sanitizeCustomerFacingMeasurementText);
   }
 
   return next;
@@ -1267,45 +1306,185 @@ function cleanDateOrNull(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
 }
 
+function normalizePhone(value = "") {
+  return String(value || "").replace(/[^0-9+]/g, "").trim();
+}
+
+function parseCustomerDetailsText(value = "") {
+  const text = String(value || "");
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const out = {};
+  for (const line of lines) {
+    const [rawKey, ...rest] = line.split(":");
+    if (!rest.length) continue;
+    const key = String(rawKey || "").trim().toLowerCase();
+    const val = rest.join(":").trim();
+    if (!val) continue;
+    if (key.includes("phone") || key.includes("mobile") || key.includes("whatsapp")) out.phone = out.phone || val;
+    if (key.includes("location") || key.includes("address") || key.includes("site")) out.location = out.location || val;
+    if (key.includes("project")) out.projectType = out.projectType || val;
+  }
+  return out;
+}
+
+function normalizeLeadDbPayload(customer = {}, actor = {}) {
+  const now = new Date().toISOString();
+  const leadId = String(customer.leadId || customer.lead_id || customer.LEADID || "").trim();
+  const name = String(customer.name || customer.clientName || customer.customerName || customer.client_name || "").trim();
+  const phone = String(customer.phone || customer.phoneNumber || customer.mobile || "").trim();
+  const whatsapp = String(customer.whatsapp || customer.whatsappNumber || customer.whatsapp_number || phone || "").trim();
+  return {
+    lead_id: leadId || null,
+    date: cleanDateOrNull(customer.date) || cleanDateOrNull(now.slice(0, 10)),
+    time: customer.timeOfInquiry || customer.time || null,
+    day: customer.day || null,
+    client_name: name || null,
+    phone: phone || null,
+    whatsapp: whatsapp || null,
+    location: customer.location || customer.address || null,
+    project_type: customer.projectType || customer.project_type || null,
+    product_inquired: customer.productInquired || customer.product_inquired || null,
+    source: customer.source || null,
+    lead_type: customer.leadType || customer.lead_type || null,
+    status: customer.status || "New Lead",
+    next_follow_up_date: cleanDateOrNull(customer.nextFollowUpDate || customer.next_follow_up_date),
+    quote_status: customer.quoteStatus || customer.lastQuoteStatus || customer.quote_status || null,
+    quotation_amount: toNumberOrNull(customer.quotationAmount || customer.quoteAmount || customer.lastQuoteTotal || customer.quotation_amount),
+    meeting_scheduled: Boolean(customer.meetingScheduled || customer.meeting_scheduled),
+    site_visit_done: Boolean(customer.siteVisitDone || customer.site_visit_done),
+    deal_closed: Boolean(customer.dealClosed || customer.deal_closed),
+    closing_amount: toNumberOrNull(customer.closingAmount || customer.closing_amount),
+    lost_reason: customer.lostReason || customer.lost_reason || null,
+    notes: customer.notes || customer.NOTES || null,
+    updated_by: actor.id || null,
+    updated_at: now,
+  };
+}
+
+function dbLeadToAppCustomer(row = {}) {
+  return {
+    id: row.id || row.lead_id || `lead_${Date.now().toString(36)}`,
+    leadId: row.lead_id || "",
+    date: row.date || "",
+    timeOfInquiry: row.time || "",
+    day: row.day || "",
+    name: row.client_name || "",
+    phone: row.phone || "",
+    whatsapp: row.whatsapp || row.phone || "",
+    email: row.email || "",
+    address: row.location || "",
+    location: row.location || "",
+    projectType: row.project_type || "",
+    productInquired: row.product_inquired || "",
+    source: row.source || "",
+    leadType: row.lead_type || "",
+    status: row.status || "New Lead",
+    nextFollowUpDate: row.next_follow_up_date || "",
+    quoteStatus: row.quote_status || "",
+    quotationAmount: Number(row.quotation_amount || 0) || 0,
+    meetingScheduled: Boolean(row.meeting_scheduled),
+    siteVisitDone: Boolean(row.site_visit_done),
+    dealClosed: Boolean(row.deal_closed),
+    closingAmount: Number(row.closing_amount || 0) || 0,
+    lostReason: row.lost_reason || "",
+    notes: row.notes || "",
+    lastQuoteStatus: row.quote_status || "",
+    lastQuoteTotal: Number(row.quotation_amount || 0) || 0,
+    createdAt: row.created_at || "",
+    updatedAt: row.updated_at || "",
+    sourceStorage: "supabase",
+  };
+}
+
+async function nextLeadIdFromSupabase() {
+  if (!SUPABASE_ENABLED) return "L0001";
+  const rows = await dbSelect("leads", "select=lead_id&limit=10000");
+  const max = (Array.isArray(rows) ? rows : []).reduce((best, row) => {
+    const match = String(row?.lead_id || "").match(/(\d+)/);
+    return Math.max(best, match ? Number(match[1]) || 0 : 0);
+  }, 0);
+  return `L${String(max + 1).padStart(4, "0")}`;
+}
+
+async function findLeadByLeadIdOrPhone({ leadId = "", phone = "" } = {}) {
+  if (!SUPABASE_ENABLED) return null;
+  const cleanLeadId = String(leadId || "").trim();
+  const cleanPhone = normalizePhone(phone);
+  if (cleanLeadId) {
+    const rows = await dbSelect("leads", `select=*&lead_id=eq.${encodeEq(cleanLeadId)}&limit=1`);
+    if (Array.isArray(rows) && rows[0]) return rows[0];
+  }
+  if (cleanPhone) {
+    const rows = await dbSelect("leads", `select=*&phone=eq.${encodeEq(phone)}&limit=1`);
+    if (Array.isArray(rows) && rows[0]) return rows[0];
+  }
+  return null;
+}
+
+async function upsertSingleLeadToSupabase(customer = {}, req = null, { generateIfMissing = true } = {}) {
+  if (!SUPABASE_ENABLED) throw new Error("Supabase is not configured.");
+  const actor = actorFromRequest(req);
+  const phone = customer.phone || customer.phoneNumber || customer.mobile || "";
+  let leadId = String(customer.leadId || customer.lead_id || customer.LEADID || "").trim();
+  const previous = await findLeadByLeadIdOrPhone({ leadId, phone });
+  if (!leadId && previous?.lead_id) leadId = previous.lead_id;
+  if (!leadId && generateIfMissing) leadId = await nextLeadIdFromSupabase();
+  if (!leadId) throw new Error("Lead ID is required before saving this lead.");
+  const payload = normalizeLeadDbPayload({ ...customer, leadId }, actor);
+  const oldSnapshot = previous ? dbLeadToAppCustomer(previous) : null;
+  const savedRows = await dbUpsert("leads", [payload], { onConflict: "lead_id" });
+  const saved = Array.isArray(savedRows) && savedRows[0] ? savedRows[0] : null;
+  if (!saved?.id) throw new Error("Lead was not returned from Supabase.");
+  const newSnapshot = dbLeadToAppCustomer(saved);
+  await writeAuditLog(req, {
+    action_type: previous ? "lead_cloud_updated" : "lead_cloud_created",
+    module: "leads",
+    target_table: "leads",
+    target_id: saved.id,
+    old_snapshot: oldSnapshot,
+    new_snapshot: newSnapshot,
+    change_summary: `${actor.name} ${previous ? "updated" : "created"} lead ${leadId} in Supabase.`,
+  });
+  return { row: saved, customer: newSnapshot };
+}
+
+async function upsertLeadFromCustomerRequestRecord(record = {}, req = null) {
+  const name = record.customer_name || "";
+  const phone = record.phone || "";
+  if (!String(name || "").trim() || !String(phone || "").trim()) return null;
+  const estimateData = record.estimate_data || {};
+  const productInquired = Array.isArray(estimateData.items) && estimateData.items.length
+    ? [...new Set(estimateData.items.map((item) => item?.subcategory || item?.product || item?.type).filter(Boolean))].join(", ")
+    : estimateData.productInquired || "Auto Quote Chat";
+  const result = await upsertSingleLeadToSupabase({
+    leadId: estimateData.leadId || "",
+    name,
+    phone,
+    location: record.location || estimateData.locationLink || "",
+    projectType: record.project_type || "",
+    productInquired,
+    source: estimateData.createdFrom || "Auto Quote Chat",
+    status: record.status && String(record.status).toLowerCase().includes("submitted") ? "Quoted" : "New Lead",
+    notes: estimateData.note || `Auto-created from chat ${estimateData.chatId || ""}`.trim(),
+  }, req, { generateIfMissing: true });
+  return result;
+}
+
 async function upsertLeadsToSupabase(customers = [], req) {
   if (!SUPABASE_ENABLED) return new Map();
-  const actor = actorFromRequest(req);
-  const valid = customers.filter((customer) => customer?.leadId || customer?.name || customer?.phone);
-  if (!valid.length) return new Map();
-  const rows = valid.map((c) => ({
-    lead_id: c.leadId || null,
-    date: cleanDateOrNull(c.date),
-    time: c.time || null,
-    day: c.day || null,
-    client_name: c.name || c.clientName || null,
-    phone: c.phone || null,
-    whatsapp: c.whatsapp || c.whatsappNumber || null,
-    location: c.location || null,
-    project_type: c.projectType || null,
-    product_inquired: c.productInquired || null,
-    source: c.source || null,
-    lead_type: c.leadType || null,
-    status: c.status || null,
-    next_follow_up_date: cleanDateOrNull(c.nextFollowUpDate),
-    quote_status: c.quoteStatus || c.lastQuoteStatus || null,
-    quotation_amount: toNumberOrNull(c.quotationAmount || c.quoteAmount || c.lastQuoteTotal),
-    meeting_scheduled: Boolean(c.meetingScheduled),
-    site_visit_done: Boolean(c.siteVisitDone),
-    deal_closed: Boolean(c.dealClosed),
-    closing_amount: toNumberOrNull(c.closingAmount),
-    lost_reason: c.lostReason || null,
-    notes: c.notes || c.NOTES || null,
-    updated_by: actor.id,
-    updated_at: new Date().toISOString(),
-  })).filter((row) => row.lead_id);
-  if (!rows.length) return new Map();
-  const saved = await dbUpsert("leads", rows, { onConflict: "lead_id" });
   const map = new Map();
-  (Array.isArray(saved) ? saved : []).forEach((row) => {
-    if (row.lead_id) map.set(row.lead_id, row.id);
-  });
+  for (const customer of customers) {
+    if (!customer?.leadId && !customer?.name && !customer?.phone) continue;
+    try {
+      const result = await upsertSingleLeadToSupabase(customer, req, { generateIfMissing: Boolean(customer?.name && customer?.phone) });
+      if (result?.customer?.leadId && result?.row?.id) map.set(result.customer.leadId, result.row.id);
+    } catch (error) {
+      rememberSupabaseIssue(`lead upsert ${customer?.leadId || customer?.name || "unknown"}`, error);
+    }
+  }
   return map;
 }
+
 
 function normalizeQuoteDbPayload(quote = {}, leadUuid = null, actor = {}) {
   const quotation = quote.quotation || {};
@@ -1566,6 +1745,23 @@ async function recordCustomerRequest(payload = {}, req = null) {
     };
   }
 
+  let linkedLead = null;
+  if (SUPABASE_ENABLED) {
+    try {
+      linkedLead = await upsertLeadFromCustomerRequestRecord(record, req);
+      if (linkedLead?.customer?.leadId) {
+        record.estimate_data = {
+          ...(record.estimate_data || {}),
+          leadId: linkedLead.customer.leadId,
+          leadUuid: linkedLead.row?.id || null,
+        };
+      }
+    } catch (error) {
+      rememberSupabaseIssue("auto-create lead from customer request", error);
+      throw error;
+    }
+  }
+
   if (!SUPABASE_ENABLED) {
     const file = path.join(DATA_DIR, "customer-requests.json");
     const existing = readJsonFile(file, []);
@@ -1577,15 +1773,23 @@ async function recordCustomerRequest(payload = {}, req = null) {
     writeJsonFile(file, existing.slice(-1000));
     return existing[existing.length - 1];
   }
-  const saved = await dbInsert("customer_requests", [{ ...record, created_at: new Date().toISOString() }]);
-  const row = Array.isArray(saved) && saved.length ? saved[0] : record;
+
+  let row = null;
+  if (previous?.id) {
+    const patched = await dbPatch("customer_requests", `id=eq.${encodeEq(previous.id)}`, record);
+    row = Array.isArray(patched) && patched.length ? patched[0] : { ...previous, ...record };
+  } else {
+    const saved = await dbInsert("customer_requests", [{ ...record, created_at: new Date().toISOString() }]);
+    row = Array.isArray(saved) && saved.length ? saved[0] : record;
+  }
   await writeAuditLog(req, {
     action_type: record.status || "customer_request_updated",
     module: "auto_quote",
     target_table: "customer_requests",
     target_id: row.id || record.estimate_data?.chatId || null,
+    old_snapshot: previous || null,
     new_snapshot: row,
-    change_summary: `Customer request updated: ${record.status || "chat_updated"}${record.customer_name ? ` for ${record.customer_name}` : ""}`,
+    change_summary: `Customer request ${previous?.id ? "updated" : "created"}: ${record.status || "chat_updated"}${record.customer_name ? ` for ${record.customer_name}` : ""}`,
   });
   return row;
 }
@@ -2312,17 +2516,89 @@ app.get("/db-health", requireStaff, async (req, res) => {
     return res.status(500).json({ ok: false, success: false, databaseEnabled: false, error: "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are not configured." });
   }
   try {
-    const auditSample = await dbSelect("audit_logs", "select=id&limit=1");
-    const userSample = await dbSelect("staff_users", "select=id&limit=1");
+    const requiredTables = ["leads", "quotes", "quote_items", "quote_versions", "customer_requests", "audit_logs", "staff_users", "app_settings"];
+    const checkedTables = {};
+    for (const table of requiredTables) {
+      const sample = await dbSelect(table, "select=*&limit=1");
+      checkedTables[table] = Array.isArray(sample);
+    }
     res.json({
       ok: true,
       success: true,
       databaseEnabled: true,
-      checkedTables: { audit_logs: Array.isArray(auditSample), staff_users: Array.isArray(userSample) },
+      checkedTables,
+      message: "Supabase connection is healthy for leads, quotes, chats, notifications, settings, staff, and audit logs.",
     });
   } catch (error) {
     rememberSupabaseIssue("database health check", error);
     res.status(500).json({ ok: false, success: false, databaseEnabled: true, error: "Database check failed. Verify SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and RLS setup in Render/Supabase.", latestIssueAt: latestSupabaseIssue?.at || null });
+  }
+});
+
+
+app.get("/leads", requireStaff, async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) {
+      return res.status(500).json({ ok: false, success: false, error: "Supabase is not configured. Leads must be managed through the database." });
+    }
+    const limit = Math.min(Math.max(Number(req.query.limit || 1000), 1), 5000);
+    const rows = await dbSelect("leads", `select=*&order=updated_at.desc&limit=${limit}`);
+    const leads = (Array.isArray(rows) ? rows : []).map(dbLeadToAppCustomer);
+    res.json({ ok: true, success: true, storage: "supabase", leads, customers: leads });
+  } catch (error) {
+    rememberSupabaseIssue("load leads", error);
+    res.status(500).json({ ok: false, success: false, error: error.message || "Could not load leads from Supabase." });
+  }
+});
+
+app.get("/leads/next-id", requireStaff, async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) {
+      return res.status(500).json({ ok: false, success: false, error: "Supabase is not configured." });
+    }
+    const nextLeadId = await nextLeadIdFromSupabase();
+    res.json({ ok: true, success: true, nextLeadId });
+  } catch (error) {
+    rememberSupabaseIssue("next lead id", error);
+    res.status(500).json({ ok: false, success: false, error: error.message || "Could not generate next Lead ID." });
+  }
+});
+
+app.post("/leads/upsert", requireStaff, async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) {
+      return res.status(500).json({ ok: false, success: false, error: "Supabase is not configured. Lead was not saved." });
+    }
+    const lead = req.body?.lead || req.body?.customer || req.body || {};
+    const result = await upsertSingleLeadToSupabase(lead, req, { generateIfMissing: true });
+    res.json({ ok: true, success: true, storage: "supabase", lead: result.customer, customer: result.customer });
+  } catch (error) {
+    rememberSupabaseIssue("upsert lead", error);
+    res.status(500).json({ ok: false, success: false, error: error.message || "Could not save lead to Supabase." });
+  }
+});
+
+app.delete("/leads/:id", requireStaff, async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) {
+      return res.status(500).json({ ok: false, success: false, error: "Supabase is not configured. Lead was not deleted." });
+    }
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ ok: false, success: false, error: "Missing lead id." });
+    const query = isUuid(id) ? `id=eq.${encodeEq(id)}` : `lead_id=eq.${encodeEq(id)}`;
+    const deleted = await dbDelete("leads", query);
+    await writeAuditLog(req, {
+      action_type: "lead_cloud_deleted",
+      module: "leads",
+      target_table: "leads",
+      target_id: id,
+      old_snapshot: Array.isArray(deleted) && deleted[0] ? dbLeadToAppCustomer(deleted[0]) : null,
+      change_summary: `${actorFromRequest(req).name} deleted lead ${id} from Supabase.`,
+    });
+    res.json({ ok: true, success: true, storage: "supabase", deleted: Array.isArray(deleted) ? deleted.length : 0 });
+  } catch (error) {
+    rememberSupabaseIssue("delete lead", error);
+    res.status(500).json({ ok: false, success: false, error: error.message || "Could not delete lead from Supabase." });
   }
 });
 
@@ -2342,6 +2618,36 @@ app.get("/quotes", requireStaff, async (req, res) => {
   }
 });
 
+app.delete("/quotes/:id", requireStaff, async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) {
+      return res.status(500).json({ ok: false, success: false, error: "Supabase is not configured. Quote was not deleted." });
+    }
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ ok: false, success: false, error: "Missing quote id or quote number." });
+    const query = isUuid(id) ? `id=eq.${encodeEq(id)}` : `quote_number=eq.${encodeEq(id)}`;
+    const existing = await dbSelect("quotes", `select=id,quote_number,quote_data&${query}&limit=1`);
+    const quote = Array.isArray(existing) && existing[0] ? existing[0] : null;
+    if (!quote?.id) return res.status(404).json({ ok: false, success: false, error: "Quote was not found in Supabase." });
+    await dbDelete("quote_items", `quote_id=eq.${encodeEq(quote.id)}`, { returning: false });
+    await dbDelete("quote_versions", `quote_id=eq.${encodeEq(quote.id)}`, { returning: false });
+    const deleted = await dbDelete("quotes", `id=eq.${encodeEq(quote.id)}`);
+    await writeAuditLog(req, {
+      action_type: "quote_cloud_deleted",
+      module: "quotes",
+      target_table: "quotes",
+      target_id: quote.id,
+      quote_number: quote.quote_number,
+      old_snapshot: quote.quote_data || quote,
+      change_summary: `${actorFromRequest(req).name} deleted quote ${quote.quote_number || id} from Supabase.`,
+    });
+    res.json({ ok: true, success: true, storage: "supabase", deleted: Array.isArray(deleted) ? deleted.length : 1 });
+  } catch (error) {
+    rememberSupabaseIssue("delete quote", error);
+    res.status(500).json({ ok: false, success: false, error: error.message || "Could not delete quote from Supabase." });
+  }
+});
+
 app.post("/quotes/upsert", requireStaff, async (req, res) => {
   try {
     const quote = req.body?.quote || req.body || {};
@@ -2350,12 +2656,27 @@ app.post("/quotes/upsert", requireStaff, async (req, res) => {
     if (!SUPABASE_ENABLED) return res.status(500).json({ ok: false, success: false, error: "Supabase is not configured." });
 
     let leadUuid = null;
-    if (quote.leadId) {
-      const existingLead = await dbSelect("leads", `select=id&lead_id=eq.${encodeEq(quote.leadId)}&limit=1`);
-      leadUuid = Array.isArray(existingLead) && existingLead[0]?.id ? existingLead[0].id : null;
+    const actor = actorFromRequest(req);
+    const detailParts = parseCustomerDetailsText(quote.customerDetails || quote.quotation?.customerDetails || "");
+    const leadName = quote.customerName || quote.quotation?.customerName || "";
+    const leadPhone = quote.phone || detailParts.phone || "";
+    if (quote.leadId || leadName || leadPhone) {
+      const leadResult = await upsertSingleLeadToSupabase({
+        leadId: quote.leadId || "",
+        name: leadName,
+        phone: leadPhone,
+        location: quote.location || detailParts.location || "",
+        projectType: quote.projectType || detailParts.projectType || "",
+        productInquired: quote.productInquired || quote.projectScope || "",
+        status: quote.quoteStatus || quote.saveAsStatus || "Quoted",
+        quoteStatus: quote.quoteStatus || quote.saveAsStatus || "Quoted",
+        quotationAmount: quote.finalTotal || quote.subtotal || 0,
+        notes: quote.saveAsNote || `Linked quote ${quoteNumber}`,
+      }, req, { generateIfMissing: true });
+      leadUuid = leadResult?.row?.id || null;
+      quote.leadId = leadResult?.customer?.leadId || quote.leadId || "";
     }
 
-    const actor = actorFromRequest(req);
     const previousRows = await dbSelect("quotes", `select=id,quote_data&quote_number=eq.${encodeEq(quoteNumber)}&limit=1`);
     const previous = Array.isArray(previousRows) && previousRows.length ? previousRows[0] : null;
     const payload = normalizeQuoteDbPayload({ ...quote, quoteNo: quoteNumber }, leadUuid, actor);
