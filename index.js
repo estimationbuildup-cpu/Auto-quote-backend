@@ -937,15 +937,68 @@ function sanitizeCustomerFacingMeasurementText(text = "") {
     .trim();
 }
 
+function joinHumanList(items = []) {
+  const list = [...new Set((Array.isArray(items) ? items : []).map((item) => String(item || "").trim()).filter(Boolean))];
+  if (list.length <= 1) return list[0] || "";
+  if (list.length === 2) return `${list[0]} and ${list[1]}`;
+  return `${list.slice(0, -1).join(", ")} and ${list[list.length - 1]}`;
+}
+
+function formatMissingQuoteDetailsForCustomer(missing = []) {
+  const labels = [...new Set((Array.isArray(missing) ? missing : []).map(sanitizeCustomerFacingMeasurementText).filter(Boolean))];
+  if (!labels.length) return "width, height and quantity";
+  const groupedByItem = new Map();
+  const standalone = [];
+  labels.forEach((label) => {
+    const match = String(label).match(/^(width|height|quantity|qty)\s+for\s+(.+)$/i);
+    if (!match) {
+      standalone.push(label);
+      return;
+    }
+    const field = match[1].toLowerCase().replace("qty", "quantity");
+    const item = match[2].replace(/^the\s+/i, "").trim();
+    groupedByItem.set(item, [...(groupedByItem.get(item) || []), field]);
+  });
+  const grouped = [...groupedByItem.entries()].map(([item, fields]) => `${joinHumanList(fields)} for the ${item}`);
+  if (grouped.length) return joinHumanList([...grouped, ...standalone]);
+  const text = labels.join(" ").toLowerCase();
+  const details = [];
+  if (/product/.test(text)) details.push("product type");
+  if (/width|height|size/.test(text)) details.push("width and height");
+  if (/quantity|qty/.test(text)) details.push("quantity");
+  return joinHumanList(details.length ? details : labels.slice(0, 3));
+}
+
 function quoteMissingQuestion(missing = []) {
-  const first = missing.slice(0, 3).join(", ");
-  if (!first) return "Can you share the product type, width, height and quantity?";
-  const cleanFirst = sanitizeCustomerFacingMeasurementText(first);
+  const cleanFirst = formatMissingQuoteDetailsForCustomer(missing);
   const options = [
-    `Can you share the ${cleanFirst}${missing.length > 3 ? " and remaining details" : ""}?`,
-    `Please send the ${cleanFirst}${missing.length > 3 ? " and the remaining quote details" : ""} so I can continue.`,
-    `Got it. I just need the ${cleanFirst}${missing.length > 3 ? " plus the remaining details" : ""} to prepare this properly.`,
-    `For accurate pricing, please share the ${cleanFirst}${missing.length > 3 ? " and remaining details" : ""}.`,
+    `Can you share the ${cleanFirst}?`,
+    `Please send the ${cleanFirst} so I can continue.`,
+    `Got it. I just need the ${cleanFirst} to prepare this properly.`,
+    `For accurate pricing, please share the ${cleanFirst}.`,
+  ];
+  return options[Math.floor(Math.random() * options.length)];
+}
+
+function missingCustomerContactFields(customer = {}) {
+  const missing = [];
+  if (!String(customer.name || customer.customerName || customer.clientName || "").trim()) missing.push("name");
+  if (!String(customer.phone || customer.phoneNumber || customer.mobile || "").trim()) missing.push("phone number");
+  return missing;
+}
+
+function customerContactQuestion(missing = [], latestText = "") {
+  const fields = joinHumanList(missing.length ? missing : ["name", "phone number"]);
+  const challenge = /did you just|without asking|why did you|you didn'?t ask|not responding|wrong|mistake|what'?s happening/i.test(String(latestText || ""));
+  const options = challenge ? [
+    `You're right — I should collect your ${fields} before saving or finalizing the quotation. Please share them and I will continue properly.`,
+    `Correct, I should not finalize it without your ${fields}. Send those details and I will save the inquiry properly.`,
+    `Good catch. Before I treat this as a proper quotation request, please share your ${fields}.`,
+  ] : [
+    `Before I prepare the quotation, please share your ${fields} so I can save the inquiry correctly.`,
+    `The product details are clear. Please send your ${fields}, then I can confirm the quote properly.`,
+    `Great, I have the size details. What is your ${fields}?`,
+    `To save this request for our team, please share your ${fields}.`,
   ];
   return options[Math.floor(Math.random() * options.length)];
 }
@@ -972,13 +1025,14 @@ Conversation order for customer mode:
    - Doors/windows/fixed glass: width and height, plus quantity.
    - Aluminium fencing/fence: width and height, plus quantity if there are separate sections. Do NOT treat a phone number as a width or height. Do NOT submit fencing to staff just because phone/location was provided.
    - Partitions/shower/railing: width and height, plus quantity/area if available.
-3. When quote-critical details are complete, summarize the products and ask for confirmation. Confirmation should be the final step before price/staff-review.
-4. After customer confirms:
+3. When quote-critical details are complete, collect the customer's name and phone number before any final price, staff submission, or quote_draft.
+4. After name and phone number are available, summarize the products and ask for confirmation. Confirmation should be the final step before price/staff-review.
+5. After customer confirms:
    - If standard configuration: return quote_draft so the app can show instant price.
    - If non-standard/custom options are selected, return quote_draft but clearly note it needs staff review. Non-standard includes frosted/fluted/tinted/reflective glass, special glass colour, non-standard thickness, special aluminium/frame colour, jumbo/special access, or unclear specifications.
-5. After quotation/review submission, ask for Google Maps location if not already shared.
-6. After location is shared, ask whether they want to book a site visit with an expert.
-Customers may start chatting without name/phone/location. Extract them from chat if mentioned and return them in customer_updates, but do not block instant standard price just because name/phone/location is missing.
+6. After quotation/review submission, ask for Google Maps location if not already shared.
+7. After location is shared, ask whether they want to book a site visit with an expert.
+Customers may start chatting without name/phone/location. Extract them from chat if mentioned and return them in customer_updates. Do not block product guidance because name/phone/location is missing, but do block final quotation/quote_draft until name and phone number are known.
 Do not ask for name, phone, location, width, height, product type, glass, and panels all in one message.
 Do not ask for Google Maps location twice. If a location or location request already exists in the conversation, continue with the missing product detail or site-visit question instead.
 Do not submit to staff or return quote_draft until quote-critical width and height details are present.
@@ -1002,7 +1056,8 @@ Smart sliding panel default:
 Before creating a draft from customer chat:
 - Detect possible items, but ask the customer to confirm first only when all quote-critical details are complete.
 - Use mode "confirm_draft" and requires_confirmation true when items are ready but customer has not confirmed.
-- If the customer confirms the summarized details, return mode "quote_draft".
+- If the customer confirms the summarized details AND name/phone are known, return mode "quote_draft".
+- If product details are complete but name or phone number is missing, ask naturally for the missing contact detail first. Do not return quote_draft yet.
 - Do not show confirmation buttons early. Confirmation means the next step is price for standard items or staff review for non-standard items.
 
 Supported item fields:
@@ -1044,7 +1099,8 @@ If the customer asks a general advice question like "sliding or folding", answer
 Example: If customer says "Doors" and asks what kinds: reply only with the door options, such as "We have Slim Sliding Doors, Folding Doors and Hinged Doors. Which one do you prefer?" Do NOT also ask size, name, phone and location in that same message.
 If enough details exist, summarize and confirm: "Just to confirm, you need ... correct?"
 Confirmation should appear only after all important product details are complete. After confirmation, the app will either price standard configurations or transparently send non-standard/custom configurations to staff review.
-Never jump straight to quote_draft in customer mode unless the customer's latest message clearly confirms the summary.
+Never jump straight to quote_draft in customer mode unless the customer's latest message clearly confirms the summary and the customer name and phone number are already known.
+If the customer challenges a mistake, asks why something happened, or asks a normal question, answer that naturally first before continuing the quote flow.
 Customer-facing measurement language must ask only for "width and height". Do not use alternative measurement wording.`;
   }
 
@@ -1149,7 +1205,20 @@ function postProcessResult(parsed = {}, { mode, prompt, messages, customer }) {
       }
       return next;
     }
-    const alreadyConfirmed = isPositiveConfirmation(lastText) || parsed.confirmed_by_customer === true || parsed.mode === "quote_draft";
+
+    const missingContact = missingCustomerContactFields(mergedCustomer);
+    if (missingContact.length) {
+      next.mode = "need_clarification";
+      next.requires_confirmation = false;
+      next.items = [];
+      const followUpQuestion = customerContactQuestion(missingContact, lastText);
+      next.questions = [followUpQuestion];
+      next.missing_required_fields = [...new Set([...(next.missing_required_fields || []), ...missingContact])];
+      next.reply = followUpQuestion;
+      return next;
+    }
+
+    const alreadyConfirmed = isPositiveConfirmation(lastText) || parsed.confirmed_by_customer === true;
     if (!alreadyConfirmed) {
       const summary = next.confirmation_summary || items.map((item, index) => {
         const name = item.subcategory || item.product || `Item ${index + 1}`;
@@ -1172,7 +1241,8 @@ function postProcessResult(parsed = {}, { mode, prompt, messages, customer }) {
       next.reply = "I will check this with the team to avoid giving wrong information. Would you like me to connect you with a real staff member?";
       next.handoff_offer = true;
     } else if (missingRequired.length && mode === "customer") {
-      next.reply = `Sure, I can help. Before staff prepares the quote, please share your ${missingRequired.join(", ")}.`;
+      const contactMissing = missingCustomerContactFields(mergedCustomer);
+      next.reply = contactMissing.length ? customerContactQuestion(contactMissing, lastText) : `Sure, I can help. Please share your ${joinHumanList(missingRequired)} so I can continue.`;
     } else {
       next.reply = "Sure, I understand. Please share the width, height and quantity so I can prepare a draft.";
     }
