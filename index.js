@@ -769,6 +769,61 @@ function shouldUseWebSearch({ mode, prompt = "", messages = [] }) {
   return /\b(best|recommend|suggest|which|what system|suitable|limitation|maximum|latest|current|search|internet|website|specification|standard|thermal break|5\s*meter|5000\s*mm|large opening|wide opening|sliding or folding|folding or sliding|compare|difference|option|available|can you|is it possible|safe|strong|waterproof|soundproof|heat|insulation|price range|dubai|uae)\b/.test(text);
 }
 
+
+function normalizeCustomerProductInquiry(text = "") {
+  const value = String(text || "").toLowerCase();
+  if (!value.trim()) return "";
+  if (/ultra\s*slim|slim\s*sliding|premium\s*sliding|minimal\s*sliding/.test(value)) return "Ultra Slim Sliding Door";
+  if (/\b105\b|105\s*series|local\s*sliding|normal\s*sliding|standard\s*local\s*sliding/.test(value)) return "Sliding Door 105 Series";
+  if (/local\s*thermal|thermal\s*break\s*sliding|thermal\s*sliding/.test(value)) return "Local Thermal Break Sliding";
+  if (/telescopic/.test(value)) return "Telescopic Sliding Door";
+  if (/pocket/.test(value)) return "Pocket Door";
+  if (/ghost/.test(value)) return "Ghost Door";
+  if (/folding|bi\s*fold|bifold/.test(value)) return "Folding Door";
+  if (/hinge|hinged/.test(value)) return "Hinged Door";
+  if (/sliding|slider|slide\s*door|sliding\s*door/.test(value)) return "Ultra Slim Sliding Door";
+  return "";
+}
+
+function normalizeAiSlidingRecommendation(item = {}) {
+  const next = { ...item };
+  const text = `${next.product || ""} ${next.type || ""} ${next.subcategory || ""} ${next.system || ""} ${next.description || ""}`.toLowerCase();
+  const explicit105 = /\b105\b|105\s*series|local\s*sliding|normal\s*sliding|standard\s*local\s*sliding/.test(text);
+  const explicitLocalThermal = /local\s*thermal|thermal\s*break\s*sliding|thermal\s*sliding/.test(text);
+  const explicitSpecial = explicit105 || explicitLocalThermal || /telescopic|pocket|ghost/.test(text);
+  const genericSliding = /sliding|slider|slide/.test(text) && !explicitSpecial && !/ultra\s*slim|slim\s*sliding|premium\s*sliding/.test(text);
+
+  if (genericSliding) {
+    next.product = next.product || "Door";
+    next.type = next.type || "Sliding";
+    next.subcategory = "Ultra Slim Sliding Door";
+    next.system = "Ultra Slim Sliding Door";
+  }
+
+  if (/ultra\s*slim|slim\s*sliding|premium\s*sliding/.test(text)) {
+    next.product = next.product || "Door";
+    next.type = next.type || "Sliding";
+    next.subcategory = "Ultra Slim Sliding Door";
+    next.system = "Ultra Slim Sliding Door";
+  }
+
+  if (explicit105) {
+    next.product = next.product || "Door";
+    next.type = next.type || "Sliding";
+    next.subcategory = "Sliding Door 105 Series";
+    next.system = "Sliding Door 105 Series";
+  }
+
+  if (explicitLocalThermal) {
+    next.product = next.product || "Door";
+    next.type = next.type || "Sliding";
+    next.subcategory = "Local Thermal Break Sliding";
+    next.system = "Local Thermal Break Sliding";
+  }
+
+  return next;
+}
+
 function extractCustomerUpdatesFromText(text = "") {
   const value = String(text || "");
   const updates = {};
@@ -791,6 +846,12 @@ function extractCustomerUpdatesFromText(text = "") {
   else if (/shop|retail|showroom/i.test(value)) updates.projectType = "Shop";
   else if (/office/i.test(value)) updates.projectType = "Office";
 
+  const productInquired = normalizeCustomerProductInquiry(value);
+  if (productInquired) {
+    updates.productInquired = productInquired;
+    updates.product_inquired = productInquired;
+  }
+
   return updates;
 }
 
@@ -803,10 +864,12 @@ function mergeCustomer(existing = {}, updates = {}) {
 
 function missingRequiredCustomerFields(customer = {}) {
   const missing = [];
-  if (!String(customer.name || customer.customerName || customer.clientName || "").trim()) missing.push("name");
+  const name = String(customer.name || customer.customerName || customer.clientName || "").trim();
+  if (!name) missing.push("name");
+  else if (!isLikelyValidCustomerName(name)) missing.push("valid name");
   const phone = String(customer.phone || customer.phoneNumber || customer.mobile || "").trim();
   if (!phone) missing.push("phone number");
-  else if (!isValidUaePhone(phone)) missing.push("valid UAE phone number");
+  else if (!isValidUaePhone(phone)) missing.push("valid phone number with correct country code/length");
   if (!String(customer.location || "").trim()) missing.push("location");
   return missing;
 }
@@ -817,22 +880,35 @@ function smartSlidingSplit(totalPanels) {
   return { slidingPanels: Math.max(1, total - fixed), fixedPanels: fixed };
 }
 
-function inferTotalPanelsFromWidth(widthMm, label = "") {
+function ultraSlimTargetPanelWidthFromHeight(heightMm) {
+  const height = Number(heightMm) || 0;
+  // Buildup rule: Ultra Slim Sliding Door can normally use panels up to about 2.3m wide x 3.0m high.
+  // If height goes above 3m, keep the recommendation conservative by reducing panel width gradually.
+  if (!height || height <= 3000) return 2300;
+  if (height <= 3300) return 2150;
+  if (height <= 3600) return 2000;
+  return 1850;
+}
+
+function inferTotalPanelsFromDimensions(widthMm, heightMm = 0, label = "") {
   const width = Number(widthMm) || 0;
   if (!width) return 2;
   const text = String(label || "").toLowerCase();
   let targetPanelWidth = 1400;
-  // Ultra slim systems can use much wider panels, so don't over-split a 5m/6m opening.
-  if (text.includes("ultra slim") || text.includes("slim sliding")) targetPanelWidth = 2500;
-  else if (text.includes("105 series") || text.includes("local thermal")) targetPanelWidth = 1200;
+  if (text.includes("ultra slim") || text.includes("slim sliding")) targetPanelWidth = ultraSlimTargetPanelWidthFromHeight(heightMm);
+  else if (text.includes("105 series") || text.includes("local thermal") || text.includes("local sliding")) targetPanelWidth = 1200;
   else if (text.includes("telescopic") || text.includes("pocket") || text.includes("ghost")) targetPanelWidth = 850;
-  return Math.max(2, Math.min(6, Math.ceil(width / targetPanelWidth)));
+  return Math.max(2, Math.min(8, Math.ceil(width / targetPanelWidth)));
+}
+
+function inferTotalPanelsFromWidth(widthMm, label = "") {
+  return inferTotalPanelsFromDimensions(widthMm, 0, label);
 }
 
 function normalizeQuoteItems(items = []) {
   if (!Array.isArray(items)) return [];
   return items.map((raw) => {
-    const item = { ...raw };
+    const item = normalizeAiSlidingRecommendation({ ...raw });
     const label = `${item.product || ""} ${item.type || ""} ${item.subcategory || item.system || ""}`.toLowerCase();
     const isSliding = /sliding|slider|slide/.test(label);
     const isFixedGlass = /fixed glass|fixed window|fixed/.test(label) && !isSliding;
@@ -843,7 +919,7 @@ function normalizeQuoteItems(items = []) {
 
     if (isSliding) {
       item.panelMode = "sliding-fixed";
-      const total = Number(item.panels || item.totalPanels || 0) || inferTotalPanelsFromWidth(item.width_mm || item.width || item.widthMm, label);
+      const total = Number(item.panels || item.totalPanels || 0) || inferTotalPanelsFromDimensions(item.width_mm || item.width || item.widthMm, item.height_mm || item.height || item.heightMm, label);
       const split = smartSlidingSplit(total);
       item.panels = total;
       item.slidingPanels = Number(item.slidingPanels || 0) || split.slidingPanels;
@@ -987,29 +1063,29 @@ function quoteMissingQuestion(missing = []) {
 
 function missingCustomerContactFields(customer = {}) {
   const missing = [];
-  if (!String(customer.name || customer.customerName || customer.clientName || "").trim()) missing.push("name");
+  const name = String(customer.name || customer.customerName || customer.clientName || "").trim();
+  if (!name) missing.push("name");
+  else if (!isLikelyValidCustomerName(name)) missing.push("valid name");
   const phone = String(customer.phone || customer.phoneNumber || customer.mobile || "").trim();
   if (!phone) missing.push("phone number");
-  else if (!isValidUaePhone(phone)) missing.push("valid UAE phone number");
+  else if (!isValidUaePhone(phone)) missing.push("valid phone number with correct country code/length");
   return missing;
 }
 
 function customerContactQuestion(missing = [], latestText = "") {
+  const lowerLatest = String(latestText || "").toLowerCase();
+  const hasProductIntent = /sliding|folding|door|window|glass|quote|price|cost|villa|partition|shower|fencing|pergola/.test(lowerLatest);
+  const needsName = (missing || []).some((item) => /name/i.test(String(item)));
+  const needsValidName = (missing || []).some((item) => /valid name/i.test(String(item)));
+  const needsPhone = (missing || []).some((item) => /phone/i.test(String(item)));
+  const invalidPhone = (missing || []).some((item) => /valid phone/i.test(String(item)));
+  if (needsValidName) return "That does not look like a valid name. Please share your real name so I can create the inquiry correctly.";
+  if (needsName && hasProductIntent) return "Of course, we can move on to that. But before anything else, I need your name and phone number so I can create your inquiry properly.";
+  if (needsName) return "Please share your name first so I can create your inquiry safely.";
+  if (invalidPhone) return "Please share a valid phone number. If you do not add a country code, I will treat it as a UAE number. If you add a country code, the number should match that country’s normal length.";
+  if (needsPhone) return "Thank you. Please share your phone number now. If you do not add a country code, I will treat it as a UAE number.";
   const fields = joinHumanList(missing.length ? missing : ["name", "phone number"]);
-  const hasInvalidPhone = (missing || []).some((item) => /valid UAE phone/i.test(String(item)));
-  const challenge = /did you just|without asking|why did you|you didn'?t ask|not responding|wrong|mistake|what'?s happening/i.test(String(latestText || ""));
-  if (hasInvalidPhone) return "Please share a valid UAE phone number, for example 05x xxx xxxx or +971 5x xxx xxxx, so our team can contact you correctly.";
-  const options = challenge ? [
-    `You're right — I should collect your ${fields} before saving or finalizing the quotation. Please share them and I will continue properly.`,
-    `Correct, I should not finalize it without your ${fields}. Send those details and I will save the inquiry properly.`,
-    `Good catch. Before I treat this as a proper quotation request, please share your ${fields}.`,
-  ] : [
-    `Before I prepare the quotation, please share your ${fields} so I can save the inquiry correctly.`,
-    `The product details are clear. Please send your ${fields}, then I can confirm the quote properly.`,
-    `Great, I have the size details. What is your ${fields}?`,
-    `To save this request for our team, please share your ${fields}.`,
-  ];
-  return options[Math.floor(Math.random() * options.length)];
+  return `Before I prepare the quotation, please share your ${fields} so I can save the inquiry correctly.`;
 }
 
 function customerLatestMessageNeedsHumanAnswer(text = "") {
@@ -1053,6 +1129,10 @@ Core behavior:
 - Vary your wording. Do not reuse the exact same sentence template for follow-up questions. Rotate naturally between short WhatsApp-style questions, helpful confirmations, and direct detail requests.
 - Do NOT repeat the same question again and again. If already asked, continue from the customer's latest answer.
 - Use the conversation history. Continue naturally and remember what the customer already answered.
+- Do NOT send automatic reminder/follow-up messages later. Only answer after the customer sends a message or selects a visible action.
+- If the customer is confused, explain clearly and politely. If they keep insisting you are wrong after you explained once, de-escalate with: "I think then I might be mistaken. I can connect this chat to a real agent for further clarifications."
+- If the customer opens site-visit booking but cancels/closes it or says no/cancel, do not thank them as if a booking was completed. Say: "It looks like you have not selected a date/time yet. Do you want to book a site visit again?"
+- Site-visit booking must have a selected date and selected time before saying it is booked.
 - Do not overwhelm the customer with a list of many fields in one message.
 - Do not promise final price, structural approval, exact delivery date, or final panel design without staff review. Say estimated/AI draft pricing can vary after team/site verification.
 - Only offer a real staff/agent handoff in these cases: (1) the customer asks for a real agent, (2) the customer seems frustrated and you cannot answer/understand after trying once, or (3) the inquiry is outside the instant pricing engine such as aluminium fencing, pergola, glass house, canopy, railing/handrail, or other custom work.
@@ -1060,19 +1140,20 @@ Core behavior:
 - If a business-specific answer is uncertain, do not say "I don't know". Say that you will check with the team, and only offer staff support if it matches the three handoff cases above.
 
 Conversation order for customer mode:
-1. Understand product type first.
-2. Collect quote-critical product details BEFORE confirmation, price, or staff submission.
+1. Before product discussion, collect a valid customer name and valid phone number. Ask for the name first. If the customer asks for a product immediately, politely say: "Of course, we can move on to that. But before anything else, I need your name and phone number so I can create your inquiry properly."
+2. Accept phone numbers with country code when the national number length matches the country. If no country code is given, treat it as a UAE number.
+3. Reject gibberish/random names like "asldjhua", "asdf", or product words as names. Ask again politely for the real name.
+4. After name and phone are captured, understand product type and collect quote-critical product details BEFORE confirmation, price, or staff submission.
    - Doors/windows/fixed glass: width and height, plus quantity.
    - Aluminium fencing/fence: width and height, plus quantity if there are separate sections. Do NOT treat a phone number as a width or height. Do NOT submit fencing to staff just because phone/location was provided.
    - Partitions/shower/railing: width and height, plus quantity/area if available.
-3. When quote-critical details are complete, collect the customer's name and phone number before any final price, staff submission, or quote_draft.
-4. After name and phone number are available, summarize the products and ask for confirmation. Confirmation should be the final step before price/staff-review.
-5. After customer confirms:
+5. After name and phone number are available and quote-critical details are complete, summarize the products and ask for confirmation. Confirmation should be the final step before price/staff-review.
+6. After customer confirms:
    - If standard configuration: return quote_draft so the app can show instant price.
    - If non-standard/custom options are selected, return quote_draft but clearly note it needs staff review. Non-standard includes frosted/fluted/tinted/reflective glass, special glass colour, non-standard thickness, special aluminium/frame colour, jumbo/special access, or unclear specifications.
 6. After quotation/review submission, ask for Google Maps location if not already shared.
-7. After location is shared, ask whether they want to book a site visit with an expert. If they agree, the app will ask the preferred date first, then show available times for that date.
-Customers may start chatting without name/phone/location. Extract them from chat if mentioned and return them in customer_updates. Do not block product guidance because name/phone/location is missing, but do block final quotation/quote_draft until name and a valid UAE phone number are known.
+7. After location is shared, ask whether they want to book a site visit with an expert. If they agree, the app will ask the preferred date first, allow them to change/close the booking picker, then show available times for that selected date. The customer can choose any future date; booking is confirmed only after they select both date and time.
+Customers may start chatting without name/phone/location, but in customer website mode you must not continue into product quotation until valid name and phone are captured. Extract them from chat if mentioned and return them in customer_updates. Do not return quote_draft until name and a valid phone number are known.
 Do not ask for name, phone, location, width, height, product type, glass, and panels all in one message.
 Do not ask for Google Maps location twice. If a location or location request already exists in the conversation, continue with the missing product detail or site-visit question instead.
 Do not submit to staff or return quote_draft until quote-critical width and height details are present.
@@ -1097,7 +1178,7 @@ Before creating a draft from customer chat:
 - Detect possible items, but ask the customer to confirm first only when all quote-critical details are complete.
 - Use mode "confirm_draft" and requires_confirmation true when items are ready but customer has not confirmed.
 - If the customer confirms the summarized details AND name/phone are known, return mode "quote_draft".
-- If product details are complete but name or a valid UAE phone number is missing, ask naturally for the missing contact detail first. Do not return quote_draft yet.
+- If product details are complete but name or a valid phone number is missing, ask naturally for the missing contact detail first. Do not return quote_draft yet.
 - Do not show confirmation buttons early. Confirmation means the next step is price for standard items or staff review for non-standard items.
 
 Supported item fields:
@@ -1138,6 +1219,13 @@ Do not ask all questions at once. Usually ask only ONE useful next question, and
 If the customer asks a general advice question like "sliding or folding", answer with simple pros/cons from your own knowledge and the company catalog. Do not say you searched or asked ChatGPT. Do not immediately ask for width and height in the same reply unless the customer directly asks for a quote/price.
 If the latest message is a general question, greeting, complaint, or comparison, return mode "reply" and keep items empty unless the customer also gave actual quote details.
 Example: If customer says "Doors" and asks what kinds: reply only with the door options, such as "We have Slim Sliding Doors, Folding Doors and Hinged Doors. Which one do you prefer?" Do NOT also ask size, name, phone and location in that same message.
+Buildup sliding-door product rule:
+- If the customer says "sliding door", "slim sliding", "best sliding", or asks for a standard sliding recommendation without naming a system, recommend and use "Ultra Slim Sliding Door" as the default/standard Buildup sliding system.
+- Do NOT recommend "Sliding Door 105 Series" as better than a local sliding system. 105 Series IS the local/normal sliding-door system. Treat it as a budget/local option only when the customer explicitly asks for 105 series, local sliding, normal sliding, or lower-budget option.
+- "Local Thermal Break Sliding" is a separate thermal-break option; do not confuse it with 105 Series.
+- For comparisons, describe Ultra Slim Sliding Door as the premium/main recommendation, and 105 Series as the local/economical 105 option. Never say 105 is better than local sliding.
+- Ultra Slim Sliding Door panel assumption: a normal panel can go up to about 2.3m wide x 3.0m high. If height goes above 3.0m, reduce the assumed panel width gradually and use more panels if needed. Do not over-split normal openings, but do not assume a single oversized panel beyond this rule.
+- If the customer gives total opening width and height but no panel count for Ultra Slim Sliding Door, infer a sensible panel count using the 2.3m x 3.0m rule and mention that final panel configuration will be verified by the team/site measurement.
 If enough details exist, summarize and confirm: "Just to confirm, you need ... correct?"
 Confirmation should appear only after all important product details are complete. After confirmation, the app will either price standard configurations or transparently send non-standard/custom configurations to staff review.
 Never jump straight to quote_draft in customer mode unless the customer's latest message clearly confirms the summary and the customer name and phone number are already known.
@@ -1442,24 +1530,54 @@ function normalizePhone(value = "") {
   return String(value || "").replace(/[^0-9+]/g, "").trim();
 }
 
+const INTERNATIONAL_PHONE_LENGTHS = [
+  ["971", [8, 9]], ["91", [10]], ["92", [10]], ["966", [9]], ["974", [8]], ["965", [8]], ["968", [8]], ["973", [8]], ["20", [10]], ["44", [10]], ["1", [10]], ["61", [9]], ["49", [10, 11]], ["33", [9]], ["39", [9, 10]], ["90", [10]], ["63", [10]], ["880", [10]], ["94", [9]], ["977", [10]], ["62", [9, 10, 11, 12]], ["60", [9, 10]], ["65", [8]], ["86", [11]], ["7", [10]],
+];
+
 function normalizeUaePhone(value = "") {
   const raw = String(value || "").trim();
-  const digits = raw.replace(/\D/g, "");
-  if (!digits) return { valid: false, normalized: "", national: "", reason: "empty" };
-  let national = digits;
-  if (national.startsWith("00971")) national = national.slice(5);
-  else if (national.startsWith("971")) national = national.slice(3);
-  else if (national.startsWith("0")) national = national.slice(1);
+  if (!raw) return { valid: false, normalized: "", national: "", countryCode: "", reason: "empty" };
+  let digits = raw.replace(/\D/g, "");
+  if (!digits) return { valid: false, normalized: "", national: "", countryCode: "", reason: "empty" };
+  const explicitInternational = /^\s*(\+|00)/.test(raw) || /^(971|91|92|966|974|965|968|973|20|44|1|61|49|33|39|90|63|880|94|977|62|60|65|86|7)/.test(digits);
+  if (!explicitInternational || /^0\d+/.test(digits)) {
+    let national = digits.startsWith("0") ? digits.slice(1) : digits;
+    const isMobile = /^5\d{8}$/.test(national);
+    const isLandline = /^(2|3|4|6|7|9)\d{7}$/.test(national);
+    const valid = isMobile || isLandline;
+    return { valid, normalized: valid ? `+971${national}` : raw, national, countryCode: "971", reason: valid ? "valid" : "invalid_uae_phone_length" };
+  }
+  if (digits.startsWith("00")) digits = digits.slice(2);
+  const match = INTERNATIONAL_PHONE_LENGTHS.slice().sort((a, b) => b[0].length - a[0].length).find(([code]) => digits.startsWith(code));
+  if (!match) return { valid: digits.length >= 8 && digits.length <= 15, normalized: digits.length >= 8 && digits.length <= 15 ? `+${digits}` : raw, national: digits, countryCode: "", reason: digits.length >= 8 && digits.length <= 15 ? "valid_e164_generic" : "unknown_country_code" };
+  const [countryCode, lengths] = match;
+  const national = digits.slice(countryCode.length);
+  const valid = lengths.includes(national.length);
+  return { valid, normalized: valid ? `+${countryCode}${national}` : raw, national, countryCode, reason: valid ? "valid" : `invalid_length_for_country_${countryCode}` };
+}
 
-  const isMobile = /^5\d{8}$/.test(national);
-  const isLandline = /^(2|3|4|6|7|9)\d{7}$/.test(national);
-  const valid = isMobile || isLandline;
-  return {
-    valid,
-    normalized: valid ? `+971${national}` : raw,
-    national,
-    reason: valid ? "valid" : "invalid_uae_phone",
-  };
+function isLikelyValidCustomerName(value = "") {
+  const cleaned = String(value || "").replace(/\s+/g, " ").trim();
+  if (cleaned.length < 2 || cleaned.length > 45) return false;
+  if (/\d|@|https?:|www\./i.test(cleaned)) return false;
+  if (!/^[\p{L}][\p{L}\s.'-]{1,44}$/u.test(cleaned)) return false;
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  if (words.length > 4) return false;
+  const lower = cleaned.toLowerCase();
+  if (/\b(sliding|door|window|glass|villa|apartment|quote|price|cost|need|want|hello|hi|test|asdf|qwerty|null|none|phone|mobile|number)\b/i.test(lower)) return false;
+  if (/(.)\1{3,}/.test(lower)) return false;
+  if (/(asdf|qwer|zxcv|hjkl|sldj|ldjh|djhu|jhua|lkjh|dfgh|random)/i.test(lower)) return false;
+  const latin = /^[a-z\s.'-]+$/i.test(cleaned);
+  if (latin) {
+    const letters = lower.replace(/[^a-z]/g, "");
+    if (letters.length >= 5) {
+      const vowels = (letters.match(/[aeiou]/g) || []).length;
+      const ratio = vowels / letters.length;
+      if (ratio < 0.18 || ratio > 0.75) return false;
+      if (/[bcdfghjklmnpqrstvwxyz]{5,}/i.test(letters)) return false;
+    }
+  }
+  return true;
 }
 
 function isValidUaePhone(value = "") {
@@ -1585,7 +1703,7 @@ async function upsertSingleLeadToSupabase(customer = {}, req = null, { generateI
   if (!SUPABASE_ENABLED) throw new Error("Supabase is not configured.");
   const actor = actorFromRequest(req);
   const phone = customer.phone || customer.phoneNumber || customer.mobile || "";
-  if (String(phone || "").trim() && !isValidUaePhone(phone)) throw new Error("Please enter a valid UAE phone number before saving this lead.");
+  if (String(phone || "").trim() && !isValidUaePhone(phone)) throw new Error("Please enter a valid phone number with the correct country code/length before saving this lead.");
   let leadId = String(customer.leadId || customer.lead_id || customer.LEADID || "").trim();
   const previous = await findLeadByLeadIdOrPhone({ leadId, phone });
   if (!leadId && previous?.lead_id) leadId = previous.lead_id;
@@ -1617,7 +1735,7 @@ async function upsertLeadFromCustomerRequestRecord(record = {}, req = null) {
   const estimateData = record.estimate_data || {};
   const productInquired = Array.isArray(estimateData.items) && estimateData.items.length
     ? [...new Set(estimateData.items.map((item) => item?.subcategory || item?.product || item?.type).filter(Boolean))].join(", ")
-    : estimateData.productInquired || "Auto Quote Chat";
+    : estimateData.productInquired || record.product_inquired || record.project_type || "Auto Quote Chat";
   const result = await upsertSingleLeadToSupabase({
     leadId: estimateData.leadId || "",
     name,
@@ -1745,6 +1863,62 @@ async function upsertQuotesToSupabase(savedQuotes = [], leadMap = new Map(), req
   }
 }
 
+function quoteNumberFromCustomerRequest(record = {}) {
+  const estimateData = record.estimate_data || {};
+  const savedQuote = estimateData.savedQuote && typeof estimateData.savedQuote === "object" ? estimateData.savedQuote : null;
+  const explicit = savedQuote?.quoteNo || savedQuote?.quotation?.referenceNo || estimateData.quoteNumber || estimateData.reviewId;
+  if (explicit) return String(explicit);
+  const chatId = String(estimateData.chatId || record.id || "").replace(/[^a-z0-9_-]/gi, "").slice(-18);
+  return chatId ? `AI-CHAT-${chatId.toUpperCase()}` : `AI-CHAT-${Date.now().toString(36).toUpperCase()}`;
+}
+
+function buildQuoteFromCustomerRequestRecord(record = {}, leadUuid = null) {
+  const estimateData = record.estimate_data || {};
+  const rows = Array.isArray(estimateData.rows) ? estimateData.rows : [];
+  const items = Array.isArray(estimateData.items) ? estimateData.items : rows;
+  if (!rows.length && !items.length) return null;
+  const savedQuote = estimateData.savedQuote && typeof estimateData.savedQuote === "object" ? estimateData.savedQuote : null;
+  const quoteNumber = quoteNumberFromCustomerRequest(record);
+  const finalTotal = toNumberOrNull(savedQuote?.finalTotal ?? estimateData.roughAmount) || rows.reduce((sum, row) => sum + (Number(row.qty || row.quantity || 1) || 1) * (Number(row.price || row.total || row.totalPrice || 0) || 0), 0);
+  const quoteStatus = String(record.status || "").includes("review") ? "AI Needs Review" : "AI Submitted";
+  return {
+    ...(savedQuote || {}),
+    id: savedQuote?.id || quoteNumber,
+    quoteNo: quoteNumber,
+    leadId: estimateData.leadId || "",
+    customerName: record.customer_name || savedQuote?.customerName || "Auto Quote Customer",
+    quoteStatus,
+    saveAsStatus: quoteStatus,
+    saveAsNote: record.status === "ai_quote_needs_review" ? `Needs staff review: ${estimateData.reviewReason || estimateData.note || record.status}` : "Created from customer AI chat.",
+    finalTotal,
+    subtotal: finalTotal,
+    rows: rows.length ? rows : items,
+    createdFrom: "auto_quote_chat",
+    chatId: estimateData.chatId || null,
+    updatedAt: new Date().toISOString(),
+    savedAt: savedQuote?.savedAt || new Date().toISOString(),
+    quotation: {
+      ...(savedQuote?.quotation || {}),
+      referenceNo: quoteNumber,
+      customerName: record.customer_name || savedQuote?.quotation?.customerName || "Auto Quote Customer",
+      customerDetails: [record.phone ? `Phone: ${record.phone}` : "", record.location ? `Location: ${record.location}` : "", record.project_type ? `Project Type: ${record.project_type}` : ""].filter(Boolean).join("\n"),
+      quoteStatus,
+      saveAsStatus: quoteStatus,
+      saveAsNote: record.status === "ai_quote_needs_review" ? `Needs staff review: ${estimateData.reviewReason || estimateData.note || record.status}` : "Created from customer AI chat.",
+    },
+  };
+}
+
+async function upsertQuoteFromCustomerRequestRecord(record = {}, leadUuid = null, req = null) {
+  if (!SUPABASE_ENABLED) return null;
+  const quote = buildQuoteFromCustomerRequestRecord(record, leadUuid);
+  if (!quote) return null;
+  const leadMap = new Map();
+  if (quote.leadId && leadUuid) leadMap.set(quote.leadId, leadUuid);
+  await upsertQuotesToSupabase([quote], leadMap, req);
+  return { quoteNumber: quote.quoteNo, table: "quotes", itemTable: "quote_items" };
+}
+
 async function syncSnapshotBusinessData(snapshot = {}, req) {
   if (!SUPABASE_ENABLED) return;
   const state = extractAppStateFromSnapshot(snapshot);
@@ -1806,6 +1980,7 @@ function normalizeCustomerRequestRecord(payload = {}) {
       note: payload.note || estimateData.note || null,
       items: payload.items || estimateData.items || [],
       rows: payload.rows || estimateData.rows || [],
+      productInquired: customer.productInquired || customer.product_inquired || payload.productInquired || payload.product_inquired || estimateData.productInquired || null,
       roughAmount: payload.roughAmount ?? estimateData.roughAmount ?? null,
       quoteNumber: payload.quoteNumber || estimateData.quoteNumber || null,
       uploadedFiles: payload.uploadedFiles || estimateData.uploadedFiles || [],
@@ -1908,6 +2083,7 @@ async function recordCustomerRequest(payload = {}, req = null) {
   }
 
   let linkedLead = null;
+  let linkedQuote = null;
   if (SUPABASE_ENABLED) {
     try {
       linkedLead = await upsertLeadFromCustomerRequestRecord(record, req);
@@ -1918,8 +2094,16 @@ async function recordCustomerRequest(payload = {}, req = null) {
           leadUuid: linkedLead.row?.id || null,
         };
       }
+      linkedQuote = await upsertQuoteFromCustomerRequestRecord(record, linkedLead?.row?.id || record.estimate_data?.leadUuid || null, req);
+      if (linkedQuote?.quoteNumber) {
+        record.estimate_data = {
+          ...(record.estimate_data || {}),
+          quoteNumber: record.estimate_data?.quoteNumber || linkedQuote.quoteNumber,
+          quoteStorage: linkedQuote,
+        };
+      }
     } catch (error) {
-      rememberSupabaseIssue("auto-create lead from customer request", error);
+      rememberSupabaseIssue("auto-create/update lead or quote from customer request", error);
       throw error;
     }
   }
@@ -2007,11 +2191,58 @@ async function loadCustomerRequestRows(limit = 120) {
   return Array.isArray(rows) ? rows : [];
 }
 
+function normalizeSiteVisitBookingDbPayload(booking = {}, actor = {}) {
+  const customer = booking.customer || {};
+  const estimateData = booking.estimate_data || {};
+  return {
+    booking_id: booking.id || booking.booking_id || `site_visit_${Date.now().toString(36)}`,
+    slot_id: booking.slotId || booking.slot_id || `${booking.date || ""} ${booking.time || ""}`.trim(),
+    lead_id_text: customer.leadId || estimateData.leadId || booking.leadId || null,
+    customer_request_chat_id: booking.chatId || estimateData.chatId || null,
+    customer_name: customer.name || customer.customerName || booking.customer_name || null,
+    phone: customer.phone || booking.phone || null,
+    location: customer.location || booking.location || null,
+    project_type: customer.projectType || booking.project_type || null,
+    product_inquired: customer.productInquired || booking.product_inquired || estimateData.productInquired || null,
+    visit_date: cleanDateOrNull(booking.date),
+    visit_time: booking.time || null,
+    label: booking.label || null,
+    status: booking.status || "booked",
+    booking_data: booking,
+    updated_by: actor.id || null,
+    updated_at: new Date().toISOString(),
+  };
+}
+
 async function readSiteVisitBookings() {
   const fallback = { bookings: [] };
   if (!SUPABASE_ENABLED) return readJsonFile(path.join(DATA_DIR, "site-visit-bookings.json"), fallback);
-  const rows = await dbSelect("app_settings", "select=setting_value&setting_key=eq.site_visit_bookings&limit=1");
-  return Array.isArray(rows) && rows[0]?.setting_value ? rows[0].setting_value : fallback;
+  try {
+    const directRows = await dbSelect("site_visit_bookings", "select=*&order=updated_at.desc&limit=500");
+    const bookings = (Array.isArray(directRows) ? directRows : []).map((row) => ({
+      ...(row.booking_data || {}),
+      id: row.booking_id,
+      slotId: row.slot_id,
+      date: row.visit_date,
+      time: row.visit_time,
+      label: row.label,
+      status: row.status,
+      customer: {
+        ...((row.booking_data || {}).customer || {}),
+        leadId: row.lead_id_text || ((row.booking_data || {}).customer || {}).leadId,
+        name: row.customer_name || ((row.booking_data || {}).customer || {}).name,
+        phone: row.phone || ((row.booking_data || {}).customer || {}).phone,
+        location: row.location || ((row.booking_data || {}).customer || {}).location,
+        projectType: row.project_type || ((row.booking_data || {}).customer || {}).projectType,
+        productInquired: row.product_inquired || ((row.booking_data || {}).customer || {}).productInquired,
+      },
+    }));
+    return { bookings, updatedAt: new Date().toISOString(), storage: "site_visit_bookings" };
+  } catch (error) {
+    rememberSupabaseIssue("site_visit_bookings table load", error);
+    const rows = await dbSelect("app_settings", "select=setting_value&setting_key=eq.site_visit_bookings&limit=1");
+    return Array.isArray(rows) && rows[0]?.setting_value ? { ...rows[0].setting_value, storage: "app_settings.site_visit_bookings_fallback" } : fallback;
+  }
 }
 
 async function writeSiteVisitBookings(value = {}, req = null) {
@@ -2021,6 +2252,16 @@ async function writeSiteVisitBookings(value = {}, req = null) {
     return data;
   }
   const actor = actorFromRequest(req);
+  let directTableSaved = false;
+  try {
+    const rows = data.bookings.map((booking) => normalizeSiteVisitBookingDbPayload(booking, actor)).filter((row) => row.slot_id);
+    if (rows.length) {
+      await dbUpsert("site_visit_bookings", rows, { onConflict: "slot_id", returning: false });
+      directTableSaved = true;
+    }
+  } catch (error) {
+    rememberSupabaseIssue("site_visit_bookings table save", error);
+  }
   await dbUpsert("app_settings", [{
     setting_key: "site_visit_bookings",
     setting_value: data,
@@ -2028,7 +2269,7 @@ async function writeSiteVisitBookings(value = {}, req = null) {
     updated_by_name: actor.name,
     updated_at: new Date().toISOString(),
   }], { onConflict: "setting_key", returning: false });
-  return data;
+  return { ...data, storage: directTableSaved ? "site_visit_bookings + app_settings.site_visit_bookings" : "app_settings.site_visit_bookings_fallback" };
 }
 
 async function readAssistantControlStatus() {
@@ -2146,10 +2387,12 @@ function hasProductInterestForSiteVisit(body = {}) {
 function siteVisitMissingRequirements(body = {}) {
   const customer = body.customer || {};
   const missing = [];
-  if (!String(customer.name || customer.customerName || customer.clientName || "").trim()) missing.push("name");
+  const name = String(customer.name || customer.customerName || customer.clientName || "").trim();
+  if (!name) missing.push("name");
+  else if (!isLikelyValidCustomerName(name)) missing.push("valid name");
   const phone = String(customer.phone || customer.phoneNumber || customer.mobile || "").trim();
   if (!phone) missing.push("phone number");
-  else if (!isValidUaePhone(phone)) missing.push("valid UAE phone number");
+  else if (!isValidUaePhone(phone)) missing.push("valid phone number with correct country code/length");
   if (!validCustomerLocation(customer.location || body.location || "")) missing.push("valid Google Maps location / site area");
   if (!hasProductInterestForSiteVisit(body)) missing.push("product interest / quote details");
   return missing;
@@ -3089,7 +3332,8 @@ app.post("/customer-lead-intake", async (req, res) => {
     const name = getCustomerDisplayName(customer);
     const phoneInfo = normalizeUaePhone(customer.phone || customer.phoneNumber || customer.mobile || body.phone || "");
     if (!name) return res.status(400).json({ ok: false, success: false, error: "Customer name is required before starting the chat." });
-    if (!phoneInfo.valid) return res.status(400).json({ ok: false, success: false, error: "Valid UAE phone number is required before starting the chat." });
+    if (!isLikelyValidCustomerName(name)) return res.status(400).json({ ok: false, success: false, error: "Please enter a real customer name before starting the chat." });
+    if (!phoneInfo.valid) return res.status(400).json({ ok: false, success: false, error: "Valid phone number is required before starting the chat. If no country code is given, it will be treated as UAE." });
 
     const leadResult = await upsertSingleLeadToSupabase({
       ...customer,
@@ -3209,11 +3453,43 @@ app.get("/site-visit-slots", async (req, res) => {
   }
 });
 
+app.post("/site-visit-cancelled", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const requestRow = await recordCustomerRequest({
+      chatId: body.chatId,
+      customer: body.customer || {},
+      conversation: body.messages || body.conversation || [],
+      status: "site_visit_not_selected",
+      eventType: "site_visit_not_selected",
+      siteVisit: { status: "not_selected", reason: body.reason || "closed_without_date_time" },
+      rows: Array.isArray(body.rows) ? body.rows : [],
+      items: Array.isArray(body.items) ? body.items : [],
+      note: "Customer did not select a site-visit date/time.",
+    }, req);
+    res.json({
+      ok: true,
+      success: true,
+      message: "Site visit not selected.",
+      savedTo: {
+        customerRequest: { table: "customer_requests", id: requestRow?.id || null, chatId: requestRow?.estimate_data?.chatId || body.chatId || null },
+        lead: requestRow?.estimate_data?.leadId ? { table: "leads", leadId: requestRow.estimate_data.leadId, id: requestRow.estimate_data.leadUuid || null } : null,
+      },
+    });
+  } catch (error) {
+    rememberSupabaseIssue("site visit cancellation", error);
+    res.status(500).json({ ok: false, success: false, error: "Could not save site visit cancellation." });
+  }
+});
+
 app.post("/site-visit-booking", async (req, res) => {
   try {
     const body = req.body || {};
     const slot = body.slot || {};
-    const slotId = slot.slotId || body.slotId;
+    const slotDate = cleanDateOrNull(slot.date || body.date || "");
+    const slotTime = String(slot.time || body.time || "").trim();
+    const slotId = slot.slotId || body.slotId || `${slotDate || ""} ${slotTime || ""}`.trim();
+    if (!slotDate || !slotTime) return res.status(400).json({ ok: false, success: false, error: "Please select both date and time before booking a site visit." });
     if (!slotId) return res.status(400).json({ ok: false, success: false, error: "Missing site visit slot." });
     const missing = siteVisitMissingRequirements(body);
     if (missing.length) {
@@ -3226,8 +3502,8 @@ app.post("/site-visit-booking", async (req, res) => {
     const booking = {
       id: `site_visit_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
       slotId,
-      date: slot.date || body.date || null,
-      time: slot.time || body.time || null,
+      date: slotDate,
+      time: slotTime,
       label: slot.label || body.label || slotId,
       customer: body.customer || {},
       chatId: body.chatId || null,
@@ -3236,8 +3512,8 @@ app.post("/site-visit-booking", async (req, res) => {
       status: "booked",
       createdAt: new Date().toISOString(),
     };
-    await writeSiteVisitBookings({ bookings: [...bookings, booking] }, req);
-    await recordCustomerRequest({
+    const bookingStorage = await writeSiteVisitBookings({ bookings: [...bookings, booking] }, req);
+    const requestRow = await recordCustomerRequest({
       chatId: body.chatId,
       customer: body.customer || {},
       conversation: body.messages || [],
@@ -3248,7 +3524,16 @@ app.post("/site-visit-booking", async (req, res) => {
       items: Array.isArray(body.items) ? body.items : [],
       note: `Customer booked site visit: ${booking.label}`,
     }, req);
-    res.json({ ok: true, success: true, booking });
+    res.json({
+      ok: true,
+      success: true,
+      booking,
+      savedTo: {
+        siteVisit: { table: bookingStorage.storage?.includes("site_visit_bookings") ? "site_visit_bookings" : "app_settings", key: bookingStorage.storage?.includes("app_settings") ? "site_visit_bookings" : null, bookingId: booking.id, slotId: booking.slotId },
+        customerRequest: { table: "customer_requests", id: requestRow?.id || null, chatId: requestRow?.estimate_data?.chatId || body.chatId || null },
+        lead: requestRow?.estimate_data?.leadId ? { table: "leads", leadId: requestRow.estimate_data.leadId, id: requestRow.estimate_data.leadUuid || null } : null,
+      },
+    });
   } catch (error) {
     rememberSupabaseIssue("site visit booking", error);
     res.status(500).json({ ok: false, success: false, error: "Could not book site visit." });
