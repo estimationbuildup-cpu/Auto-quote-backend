@@ -38,6 +38,9 @@ const FRONTEND_ROWS_STORAGE_KEY = "estimation-grid-rows-v8";
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || "";
 const SUPABASE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+const CUSTOMER_DOCUMENT_BUCKET = String(process.env.CUSTOMER_DOCUMENT_BUCKET || "customer-documents").trim() || "customer-documents";
+const CUSTOMER_DOCUMENT_RETENTION_DAYS = Math.max(1, Number(process.env.CUSTOMER_DOCUMENT_RETENTION_DAYS || 30) || 30);
+let customerDocumentBucketReady = false;
 
 const ASSISTANT_DISABLE_PHRASE = String(process.env.ASSISTANT_DISABLE_PHRASE || process.env.AI_DISABLE_PHRASE || "").trim();
 const ASSISTANT_ENABLE_PHRASE = String(process.env.ASSISTANT_ENABLE_PHRASE || process.env.AI_ENABLE_PHRASE || "").trim();
@@ -152,6 +155,95 @@ async function supabaseRest(pathname, { method = "GET", body, headers = {} } = {
     throw new Error(`Supabase ${method} ${pathname} failed: ${message}`);
   }
   return data;
+}
+
+async function supabaseStorage(pathname, { method = "GET", body, headers = {} } = {}) {
+  if (!SUPABASE_ENABLED) throw new Error("Supabase is not configured. Add SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Render.");
+  const response = await fetch(`${SUPABASE_URL}/storage/v1/${pathname}`, {
+    method,
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      ...headers,
+    },
+    body,
+  });
+  const text = await response.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch { data = text; }
+  }
+  if (!response.ok) {
+    const message = typeof data === "object" && data ? (data.message || data.error || JSON.stringify(data)) : (text || response.statusText);
+    throw new Error(`Supabase Storage ${method} ${pathname} failed: ${message}`);
+  }
+  return data;
+}
+
+function sanitizeStorageSegment(value = "file") {
+  return String(value || "file")
+    .normalize("NFKD")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 120) || "file";
+}
+
+function decodeDataUrl(dataUrl = "") {
+  const match = String(dataUrl || "").match(/^data:([^;,]+)?(;base64)?,([\s\S]+)$/);
+  if (!match) throw new Error("Uploaded file data is invalid.");
+  const mimeType = match[1] || "application/octet-stream";
+  const buffer = match[2] ? Buffer.from(match[3], "base64") : Buffer.from(decodeURIComponent(match[3]), "utf8");
+  return { mimeType, buffer };
+}
+
+async function ensureCustomerDocumentBucket() {
+  if (customerDocumentBucketReady) return;
+  try {
+    await supabaseStorage("bucket", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: CUSTOMER_DOCUMENT_BUCKET,
+        name: CUSTOMER_DOCUMENT_BUCKET,
+        public: false,
+        file_size_limit: 12 * 1024 * 1024,
+        allowed_mime_types: ["application/pdf", "image/png", "image/jpeg", "image/webp"],
+      }),
+    });
+  } catch (error) {
+    if (!/already exists|duplicate/i.test(error?.message || "")) throw error;
+  }
+  customerDocumentBucketReady = true;
+}
+
+async function uploadCustomerDocumentObject({ chatId, fileName, mimeType, buffer }) {
+  await ensureCustomerDocumentBucket();
+  const safeChat = sanitizeStorageSegment(chatId || "unlinked-chat");
+  const safeName = sanitizeStorageSegment(fileName || "uploaded-file");
+  const objectPath = `customer-chat/${safeChat}/${Date.now()}-${crypto.randomBytes(4).toString("hex")}-${safeName}`;
+  const encodedPath = objectPath.split("/").map(encodeURIComponent).join("/");
+  await supabaseStorage(`object/${encodeURIComponent(CUSTOMER_DOCUMENT_BUCKET)}/${encodedPath}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": mimeType || "application/octet-stream",
+      "x-upsert": "false",
+      "cache-control": "private, max-age=0",
+    },
+    body: buffer,
+  });
+  return { bucket: CUSTOMER_DOCUMENT_BUCKET, path: objectPath };
+}
+
+async function createCustomerDocumentSignedUrl(storagePath, expiresIn = 900) {
+  const encodedPath = String(storagePath || "").split("/").map(encodeURIComponent).join("/");
+  const data = await supabaseStorage(`object/sign/${encodeURIComponent(CUSTOMER_DOCUMENT_BUCKET)}/${encodedPath}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ expiresIn }),
+  });
+  const signedPath = data?.signedURL || data?.signedUrl || data?.signed_url || "";
+  return signedPath ? `${SUPABASE_URL}/storage/v1${signedPath.startsWith("/") ? "" : "/"}${signedPath}` : "";
 }
 
 function encodeEq(value = "") {
@@ -3398,30 +3490,113 @@ app.post("/customer-request", async (req, res) => {
 
 app.post("/customer-document", async (req, res) => {
   try {
+    if (!SUPABASE_ENABLED) throw new Error("Supabase is not configured. The document was not stored.");
     const body = req.body || {};
     const file = body.file || {};
+    const chatId = String(body.chatId || "").trim();
+    if (!chatId) throw new Error("Chat ID is required before storing a document.");
+    if (!file.dataUrl) throw new Error("No document data was received.");
+
+    const { mimeType: decodedMime, buffer } = decodeDataUrl(file.dataUrl);
+    const mimeType = String(file.type || decodedMime || "application/octet-stream").toLowerCase();
+    const fileName = String(file.name || body.name || "uploaded-file").trim() || "uploaded-file";
+    const allowed = mimeType === "application/pdf" || ["image/png", "image/jpeg", "image/webp"].includes(mimeType);
+    if (!allowed) throw new Error("Only PDF, PNG, JPG and WEBP files are supported.");
+    if (!buffer.length) throw new Error("The selected file is empty.");
+    if (buffer.length > 12 * 1024 * 1024) throw new Error("Please upload a file under 12 MB.");
+
+    const storage = await uploadCustomerDocumentObject({ chatId, fileName, mimeType, buffer });
+    const expiresAt = new Date(Date.now() + CUSTOMER_DOCUMENT_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
     const uploadedFile = {
-      id: `doc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-      name: file.name || body.name || "uploaded-file",
-      type: file.type || body.type || "application/octet-stream",
-      size: Number(file.size || body.size || 0) || 0,
+      name: fileName,
+      type: mimeType,
+      size: buffer.length,
       uploadedAt: new Date().toISOString(),
-      dataUrl: file.dataUrl || body.dataUrl || null,
+      bucket: storage.bucket,
+      storagePath: storage.path,
+      temporary: true,
+      expiresAt,
     };
-    const row = await recordCustomerRequest({
-      chatId: body.chatId,
+
+    const requestRow = await recordCustomerRequest({
+      chatId,
       customer: body.customer || {},
-      conversation: body.messages || [],
+      conversation: body.messages || body.conversation || [],
       status: "document_uploaded",
       eventType: "document_uploaded",
-      note: `Customer uploaded ${uploadedFile.name}`,
+      note: `Customer document stored: ${fileName}`,
       uploadedFiles: [uploadedFile],
       estimate_data: { uploadedFiles: [uploadedFile], documentReviewRequired: true },
     }, req);
-    res.json({ ok: true, success: true, file: uploadedFile, request: row });
+
+    const leadIdText = requestRow?.estimate_data?.leadId || body.customer?.leadId || body.customer?.lead_id || null;
+    const leadUuid = requestRow?.estimate_data?.leadUuid || body.customer?.leadUuid || null;
+    const inserted = await dbInsert("attachments", [{
+      lead_uuid: isUuid(leadUuid) ? leadUuid : null,
+      lead_id_text: leadIdText || null,
+      customer_request_id: isUuid(requestRow?.id) ? requestRow.id : null,
+      chat_id: chatId,
+      file_name: fileName,
+      mime_type: mimeType,
+      file_size: buffer.length,
+      storage_bucket: storage.bucket,
+      storage_path: storage.path,
+      source: "customer_ai_chat",
+      status: "temporary",
+      temporary: true,
+      expires_at: expiresAt,
+      metadata: { originalSize: Number(file.size || 0) || buffer.length, uploadedFrom: "customer_chat" },
+    }]);
+    const attachment = Array.isArray(inserted) && inserted[0] ? inserted[0] : null;
+    if (!attachment?.id) throw new Error("Document file was uploaded, but its database record could not be created.");
+
+    await writeAuditLog(req, {
+      action_type: "customer_document_stored",
+      module: "auto_quote",
+      target_table: "attachments",
+      target_id: attachment.id,
+      new_snapshot: { ...attachment, storage_path: storage.path },
+      change_summary: `Customer document ${fileName} stored temporarily and linked to chat ${chatId}.`,
+    });
+
+    res.json({
+      ok: true,
+      success: true,
+      stored: true,
+      storage: "supabase_storage+attachments",
+      attachment: {
+        id: attachment.id,
+        fileName: attachment.file_name,
+        mimeType: attachment.mime_type,
+        fileSize: attachment.file_size,
+        storageBucket: attachment.storage_bucket,
+        storagePath: attachment.storage_path,
+        temporary: attachment.temporary,
+        expiresAt: attachment.expires_at,
+      },
+      request: requestRow,
+      savedTo: {
+        file: { service: "Supabase Storage", bucket: storage.bucket, path: storage.path },
+        metadata: { table: "attachments", id: attachment.id },
+        chat: { table: "customer_requests", id: requestRow?.id || null, chatId },
+      },
+    });
   } catch (error) {
     rememberSupabaseIssue("customer document upload", error);
-    res.status(500).json({ ok: false, success: false, error: "Could not save uploaded document." });
+    res.status(500).json({ ok: false, success: false, stored: false, error: error.message || "Could not store uploaded document." });
+  }
+});
+
+app.get("/customer-document/:id/download", requireStaff, async (req, res) => {
+  try {
+    const rows = await dbSelect("attachments", `select=*&id=eq.${encodeEq(req.params.id)}&limit=1`);
+    const row = Array.isArray(rows) ? rows[0] : null;
+    if (!row?.storage_path) return res.status(404).json({ ok: false, success: false, error: "Document not found." });
+    const signedUrl = await createCustomerDocumentSignedUrl(row.storage_path, 900);
+    res.json({ ok: true, success: true, attachment: row, signedUrl, expiresInSeconds: 900 });
+  } catch (error) {
+    rememberSupabaseIssue("customer document signed URL", error);
+    res.status(500).json({ ok: false, success: false, error: error.message || "Could not open document." });
   }
 });
 
