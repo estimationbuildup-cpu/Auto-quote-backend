@@ -14,6 +14,7 @@ const PORT = process.env.PORT || 5000;
 const DEFAULT_OPENAI_MODEL = "gpt-5.5";
 const MODEL = String(process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL).trim();
 const WEB_SEARCH_MODEL = String(process.env.OPENAI_WEB_SEARCH_MODEL || MODEL).trim();
+const DOCUMENT_ANALYSIS_MODEL = String(process.env.OPENAI_DOCUMENT_MODEL || "gpt-4o").trim();
 const ENABLE_WEB_SEARCH = process.env.ENABLE_WEB_SEARCH !== "false";
 const STAFF_CONTACT_NAME = process.env.STAFF_CONTACT_NAME || "Jithin";
 const STAFF_CONTACT_PHONE = process.env.AGENT_FALLBACK_PHONE || process.env.JITHIN_CONTACT_PHONE || "+971559665623";
@@ -244,6 +245,143 @@ async function createCustomerDocumentSignedUrl(storagePath, expiresIn = 900) {
   });
   const signedPath = data?.signedURL || data?.signedUrl || data?.signed_url || "";
   return signedPath ? `${SUPABASE_URL}/storage/v1${signedPath.startsWith("/") ? "" : "/"}${signedPath}` : "";
+}
+
+async function verifyCustomerDocumentObject(storagePath) {
+  const signedUrl = await createCustomerDocumentSignedUrl(storagePath, 180);
+  if (!signedUrl) throw new Error("The file upload completed, but Supabase could not create a verification link.");
+  const response = await fetch(signedUrl, { method: "GET", headers: { Range: "bytes=0-0" } });
+  if (!response.ok && response.status !== 206) {
+    throw new Error(`Supabase Storage verification failed with status ${response.status}.`);
+  }
+  return { verified: true, verifiedAt: new Date().toISOString() };
+}
+
+async function deleteCustomerDocumentObject(storagePath) {
+  if (!storagePath) return;
+  const encodedPath = String(storagePath).split("/").map(encodeURIComponent).join("/");
+  try {
+    await supabaseStorage(`object/${encodeURIComponent(CUSTOMER_DOCUMENT_BUCKET)}/${encodedPath}`, { method: "DELETE" });
+  } catch (error) {
+    console.warn("Could not clean up uploaded object after metadata failure:", error?.message || error);
+  }
+}
+
+function normalizeDetectedDocumentSystem(value = "") {
+  const text = String(value || "").trim();
+  const lower = text.toLowerCase();
+  if (!lower) return "";
+  if (/ultra\s*slim|slim\s*sliding/.test(lower)) return "Ultra Slim Sliding Door";
+  if (/105/.test(lower) || /local\s*(?:sliding|system)/.test(lower)) return "Sliding Door 105 Series";
+  if (/thermal\s*break.*sliding|sliding.*thermal\s*break/.test(lower)) return "Local Thermal Break Sliding";
+  if (/telescop/.test(lower)) return "Telescopic Sliding Door";
+  if (/pocket/.test(lower)) return "Pocket Door";
+  if (/ghost/.test(lower)) return "Ghost Door";
+  if (/fold/.test(lower) && /slim/.test(lower)) return "Slim Folding Door";
+  if (/fold/.test(lower) && /internal/.test(lower)) return "Internal Folding Door";
+  if (/fold/.test(lower)) return "Folding Door";
+  if (/fixed\s*glass/.test(lower)) return "Fixed Glass";
+  if (/shower/.test(lower)) return "Shower Glass";
+  if (/partition/.test(lower)) return "Glass Partition";
+  if (/sliding/.test(lower)) return "Ultra Slim Sliding Door";
+  return text;
+}
+
+function normalizeDocumentAnalysis(raw = {}, fileName = "uploaded-file") {
+  const detectedSystem = normalizeDetectedDocumentSystem(raw.detected_system || raw.detectedSystem || raw.product || raw.system || "");
+  const customerUpdatesRaw = raw.customer_updates || raw.customerUpdates || {};
+  const customerUpdates = {
+    ...customerUpdatesRaw,
+    productInquired: customerUpdatesRaw.productInquired || customerUpdatesRaw.product_inquired || detectedSystem || null,
+    location: customerUpdatesRaw.location || raw.location || null,
+    projectType: customerUpdatesRaw.projectType || customerUpdatesRaw.project_type || raw.project_type || raw.projectType || null,
+  };
+  const items = Array.isArray(raw.items) ? raw.items : [];
+  const confidenceNumber = Number(raw.confidence);
+  const confidence = Number.isFinite(confidenceNumber) ? Math.max(0, Math.min(1, confidenceNumber)) : null;
+  const summary = String(raw.summary || raw.description || "").trim();
+  const reply = String(raw.reply || raw.customer_reply || raw.customerReply || "").trim()
+    || (detectedSystem
+      ? `I reviewed ${fileName}. It appears to show ${detectedSystem}${confidence !== null ? ` (${Math.round(confidence * 100)}% confidence)` : ""}. ${summary || "Please confirm the visible size or tell me what you want to change."}`
+      : `I reviewed ${fileName}, but I could not identify the exact system confidently. Please tell me which product or detail you want me to focus on.`);
+  return {
+    detectedSystem,
+    category: String(raw.category || "").trim() || null,
+    confidence,
+    summary,
+    evidence: Array.isArray(raw.evidence) ? raw.evidence.map(String).slice(0, 12) : [],
+    visibleText: Array.isArray(raw.visible_text || raw.visibleText) ? (raw.visible_text || raw.visibleText).map(String).slice(0, 50) : [],
+    dimensions: Array.isArray(raw.dimensions) ? raw.dimensions.slice(0, 30) : [],
+    quantity: raw.quantity ?? null,
+    panelAssumption: raw.panel_assumption || raw.panelAssumption || null,
+    glassType: raw.glass_type || raw.glassType || null,
+    colour: raw.colour || raw.color || null,
+    needsClarification: Boolean(raw.needs_clarification || raw.needsClarification),
+    clarificationQuestions: Array.isArray(raw.clarification_questions || raw.clarificationQuestions) ? (raw.clarification_questions || raw.clarificationQuestions).map(String).slice(0, 8) : [],
+    customerUpdates,
+    items,
+    reply,
+  };
+}
+
+async function analyzeCustomerDocument({ fileName, mimeType, dataUrl, buffer, customer = {}, messages = [] }) {
+  if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is missing, so the stored document cannot be analyzed.");
+  const analysisPrompt = `You are the document and image analysis assistant for Buildup Glass & Aluminum in the UAE.
+
+Study the uploaded customer file carefully. Identify the aluminium/glass product or system only from visible evidence. Extract useful quotation details such as product/system, dimensions, quantity, panel arrangement, glass type, colour, location, project type, drawing codes and notes. Do not invent dimensions or hidden details.
+
+Business rules:
+- A generic slim/sliding system should map to Ultra Slim Sliding Door unless the file explicitly says 105 Series/local/normal sliding.
+- Sliding Door 105 Series is the local/normal sliding system. Never describe 105 as separate from or superior to local sliding.
+- Ultra Slim Sliding Door normal panel assumption is up to about 2.3m wide x 3.0m high. If height exceeds 3.0m, reduce assumed panel width and flag final engineering/site verification.
+- If uncertain, state what is visible and ask one precise clarification question.
+- Never claim a file contains information that is not visible.
+
+Return valid JSON only with this shape:
+{
+  "detected_system": "",
+  "category": "",
+  "confidence": 0.0,
+  "summary": "",
+  "evidence": [],
+  "visible_text": [],
+  "dimensions": [],
+  "quantity": null,
+  "panel_assumption": null,
+  "glass_type": null,
+  "colour": null,
+  "location": null,
+  "project_type": null,
+  "needs_clarification": false,
+  "clarification_questions": [],
+  "customer_updates": {"productInquired": null, "location": null, "projectType": null},
+  "items": [],
+  "reply": "A concise customer-facing response that explains what you found and naturally continues the quotation chat."
+}
+
+Known customer: ${JSON.stringify(customer || {})}
+Recent chat: ${JSON.stringify((Array.isArray(messages) ? messages : []).slice(-12))}`;
+
+  const content = [{ type: "input_text", text: analysisPrompt }];
+  if (mimeType === "application/pdf") {
+    content.unshift({ type: "input_file", filename: fileName, file_data: buffer.toString("base64") });
+  } else {
+    content.unshift({ type: "input_image", image_url: dataUrl, detail: "high" });
+  }
+
+  const response = await client.responses.create({
+    model: DOCUMENT_ANALYSIS_MODEL,
+    input: [{ role: "user", content }],
+    max_output_tokens: 2200,
+    store: false,
+  });
+  const rawText = response.output_text || "{}";
+  return {
+    analysis: normalizeDocumentAnalysis(safeParseJson(rawText), fileName),
+    model: DOCUMENT_ANALYSIS_MODEL,
+    responseId: response.id || null,
+    usage: response.usage || null,
+  };
 }
 
 function encodeEq(value = "") {
@@ -958,7 +1096,7 @@ function missingRequiredCustomerFields(customer = {}) {
   const missing = [];
   const name = String(customer.name || customer.customerName || customer.clientName || "").trim();
   if (!name) missing.push("name");
-  else if (!isLikelyValidCustomerName(name)) missing.push("valid name");
+  else if (!hasAcceptedCustomerIdentity(customer) && !isLikelyValidCustomerName(name)) missing.push("valid name");
   const phone = String(customer.phone || customer.phoneNumber || customer.mobile || "").trim();
   if (!phone) missing.push("phone number");
   else if (!isValidUaePhone(phone)) missing.push("valid phone number with correct country code/length");
@@ -1157,7 +1295,7 @@ function missingCustomerContactFields(customer = {}) {
   const missing = [];
   const name = String(customer.name || customer.customerName || customer.clientName || "").trim();
   if (!name) missing.push("name");
-  else if (!isLikelyValidCustomerName(name)) missing.push("valid name");
+  else if (!hasAcceptedCustomerIdentity(customer) && !isLikelyValidCustomerName(name)) missing.push("valid name");
   const phone = String(customer.phone || customer.phoneNumber || customer.mobile || "").trim();
   if (!phone) missing.push("phone number");
   else if (!isValidUaePhone(phone)) missing.push("valid phone number with correct country code/length");
@@ -1174,8 +1312,8 @@ function customerContactQuestion(missing = [], latestText = "") {
   if (needsValidName) return "That does not look like a valid name. Please share your real name so I can create the inquiry correctly.";
   if (needsName && hasProductIntent) return "Of course, we can move on to that. But before anything else, I need your name and phone number so I can create your inquiry properly.";
   if (needsName) return "Please share your name first so I can create your inquiry safely.";
-  if (invalidPhone) return "Please share a valid phone number. If you do not add a country code, I will treat it as a UAE number. If you add a country code, the number should match that country’s normal length.";
-  if (needsPhone) return "Thank you. Please share your phone number now. If you do not add a country code, I will treat it as a UAE number.";
+  if (invalidPhone) return "Please share a valid phone number so our team can contact you regarding the inquiry.";
+  if (needsPhone) return "Thank you. Please share your phone number now so I can create your inquiry.";
   const fields = joinHumanList(missing.length ? missing : ["name", "phone number"]);
   return `Before I prepare the quotation, please share your ${fields} so I can save the inquiry correctly.`;
 }
@@ -1228,6 +1366,8 @@ Core behavior:
 - Do not overwhelm the customer with a list of many fields in one message.
 - Do not promise final price, structural approval, exact delivery date, or final panel design without staff review. Say estimated/AI draft pricing can vary after team/site verification.
 - Only offer a real staff/agent handoff in these cases: (1) the customer asks for a real agent, (2) the customer seems frustrated and you cannot answer/understand after trying once, or (3) the inquiry is outside the instant pricing engine such as aluminium fencing, pergola, glass house, canopy, railing/handrail, or other custom work.
+- When a real-agent request is made, do not immediately share any staff phone number. Say the request was sent and that the app will share the contact only if nobody joins within 5 minutes.
+- If a customer name was already accepted or the lead was already created, never ask for the name again and never reclassify it as invalid later in the same chat.
 - Do NOT offer or request a real agent just because a site visit was booked, a location was shared, or normal quote details are missing.
 - If a business-specific answer is uncertain, do not say "I don't know". Say that you will check with the team, and only offer staff support if it matches the three handoff cases above.
 
@@ -1670,6 +1810,18 @@ function isLikelyValidCustomerName(value = "") {
     }
   }
   return true;
+}
+
+function hasAcceptedCustomerIdentity(customer = {}) {
+  return Boolean(
+    customer?.contactValidated
+    || customer?.nameAccepted
+    || customer?.identityAccepted
+    || customer?.leadId
+    || customer?.lead_id
+    || customer?.leadUuid
+    || customer?.lead_uuid
+  );
 }
 
 function isValidUaePhone(value = "") {
@@ -2481,7 +2633,7 @@ function siteVisitMissingRequirements(body = {}) {
   const missing = [];
   const name = String(customer.name || customer.customerName || customer.clientName || "").trim();
   if (!name) missing.push("name");
-  else if (!isLikelyValidCustomerName(name)) missing.push("valid name");
+  else if (!hasAcceptedCustomerIdentity(customer) && !isLikelyValidCustomerName(name)) missing.push("valid name");
   const phone = String(customer.phone || customer.phoneNumber || customer.mobile || "").trim();
   if (!phone) missing.push("phone number");
   else if (!isValidUaePhone(phone)) missing.push("valid phone number with correct country code/length");
@@ -3424,7 +3576,7 @@ app.post("/customer-lead-intake", async (req, res) => {
     const name = getCustomerDisplayName(customer);
     const phoneInfo = normalizeUaePhone(customer.phone || customer.phoneNumber || customer.mobile || body.phone || "");
     if (!name) return res.status(400).json({ ok: false, success: false, error: "Customer name is required before starting the chat." });
-    if (!isLikelyValidCustomerName(name)) return res.status(400).json({ ok: false, success: false, error: "Please enter a real customer name before starting the chat." });
+    if (!hasAcceptedCustomerIdentity(customer) && !isLikelyValidCustomerName(name)) return res.status(400).json({ ok: false, success: false, error: "Please enter a real customer name before starting the chat." });
     if (!phoneInfo.valid) return res.status(400).json({ ok: false, success: false, error: "Valid phone number is required before starting the chat. If no country code is given, it will be treated as UAE." });
 
     const leadResult = await upsertSingleLeadToSupabase({
@@ -3435,6 +3587,8 @@ app.post("/customer-lead-intake", async (req, res) => {
       leadType: customer.leadType || "Customer Website Chat",
       status: customer.status || "New Lead",
       productInquired: customer.productInquired || customer.projectType || "Pending inquiry details",
+      contactValidated: true,
+      nameAccepted: true,
     }, req, { generateIfMissing: true });
 
     const requestRow = await recordCustomerRequest({
@@ -3445,6 +3599,8 @@ app.post("/customer-lead-intake", async (req, res) => {
         phone: phoneInfo.normalized,
         leadId: leadResult.customer.leadId,
         leadUuid: leadResult.row?.id || null,
+        contactValidated: true,
+        nameAccepted: true,
       },
       messages: body.messages || body.conversation || [],
       conversation: body.conversation || body.messages || [],
@@ -3457,6 +3613,8 @@ app.post("/customer-lead-intake", async (req, res) => {
         leadUuid: leadResult.row?.id || null,
         eventType: "lead_created_contact_captured",
         contactCapturedFirst: true,
+        contactValidated: true,
+        nameAccepted: true,
       },
     }, req);
 
@@ -3489,6 +3647,7 @@ app.post("/customer-request", async (req, res) => {
 });
 
 app.post("/customer-document", async (req, res) => {
+  let uploadedStoragePath = "";
   try {
     if (!SUPABASE_ENABLED) throw new Error("Supabase is not configured. The document was not stored.");
     const body = req.body || {};
@@ -3505,7 +3664,38 @@ app.post("/customer-document", async (req, res) => {
     if (!buffer.length) throw new Error("The selected file is empty.");
     if (buffer.length > 12 * 1024 * 1024) throw new Error("Please upload a file under 12 MB.");
 
+    // 1) Store in the private Supabase bucket.
     const storage = await uploadCustomerDocumentObject({ chatId, fileName, mimeType, buffer });
+    uploadedStoragePath = storage.path;
+
+    // 2) Prove that the exact object can be read back from Supabase Storage.
+    const storageVerification = await verifyCustomerDocumentObject(storage.path);
+
+    // 3) Analyze the actual image/PDF content with a multimodal OpenAI model.
+    let analysisResult = null;
+    let analysisError = null;
+    try {
+      analysisResult = await analyzeCustomerDocument({
+        fileName,
+        mimeType,
+        dataUrl: file.dataUrl,
+        buffer,
+        customer: body.customer || {},
+        messages: body.messages || body.conversation || [],
+      });
+    } catch (error) {
+      analysisError = error?.message || "The document could not be analyzed.";
+      console.error("Customer document analysis failed:", analysisError);
+    }
+
+    const analysis = analysisResult?.analysis || null;
+    const mergedCustomer = {
+      ...(body.customer || {}),
+      ...(analysis?.customerUpdates || {}),
+      productInquired: analysis?.customerUpdates?.productInquired || body.customer?.productInquired || body.customer?.product_inquired || null,
+      projectType: analysis?.customerUpdates?.projectType || body.customer?.projectType || body.customer?.project_type || null,
+      location: analysis?.customerUpdates?.location || body.customer?.location || null,
+    };
     const expiresAt = new Date(Date.now() + CUSTOMER_DOCUMENT_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
     const uploadedFile = {
       name: fileName,
@@ -3514,76 +3704,171 @@ app.post("/customer-document", async (req, res) => {
       uploadedAt: new Date().toISOString(),
       bucket: storage.bucket,
       storagePath: storage.path,
+      storageVerified: true,
+      storageVerifiedAt: storageVerification.verifiedAt,
       temporary: true,
       expiresAt,
+      analysisStatus: analysis ? "completed" : "failed",
+      analysis: analysis || null,
+      analysisError,
     };
+    const analysisMessage = analysis?.reply
+      ? {
+          id: `document_analysis_${Date.now().toString(36)}`,
+          role: "assistant",
+          sender: "assistant",
+          content: analysis.reply,
+          text: analysis.reply,
+          kind: "document-analysis",
+          at: new Date().toISOString(),
+        }
+      : null;
+    const incomingConversation = Array.isArray(body.messages || body.conversation) ? (body.messages || body.conversation) : [];
+    const requestConversation = analysisMessage ? [...incomingConversation, analysisMessage] : incomingConversation;
 
+    // 4) Update the linked lead and customer request with everything extracted from the document.
     const requestRow = await recordCustomerRequest({
       chatId,
-      customer: body.customer || {},
-      conversation: body.messages || body.conversation || [],
-      status: "document_uploaded",
-      eventType: "document_uploaded",
-      note: `Customer document stored: ${fileName}`,
+      customer: mergedCustomer,
+      conversation: requestConversation,
+      status: analysis ? "document_analyzed" : "document_analysis_failed",
+      eventType: analysis ? "document_analyzed" : "document_analysis_failed",
+      note: analysis
+        ? `Customer document analyzed: ${fileName}. Detected system: ${analysis.detectedSystem || "not confirmed"}.`
+        : `Customer document stored but analysis failed: ${fileName}.`,
+      items: analysis?.items || [],
+      rows: analysis?.items || [],
+      productInquired: analysis?.detectedSystem || mergedCustomer.productInquired || null,
       uploadedFiles: [uploadedFile],
-      estimate_data: { uploadedFiles: [uploadedFile], documentReviewRequired: true },
+      estimate_data: {
+        uploadedFiles: [uploadedFile],
+        documentAnalysisRequired: !analysis,
+        documentAnalysis: analysis,
+        documentAnalysisModel: analysisResult?.model || DOCUMENT_ANALYSIS_MODEL,
+        documentAnalysisResponseId: analysisResult?.responseId || null,
+        documentAnalysisError: analysisError,
+      },
     }, req);
 
-    const leadIdText = requestRow?.estimate_data?.leadId || body.customer?.leadId || body.customer?.lead_id || null;
-    const leadUuid = requestRow?.estimate_data?.leadUuid || body.customer?.leadUuid || null;
-    const inserted = await dbInsert("attachments", [{
-      lead_uuid: isUuid(leadUuid) ? leadUuid : null,
-      lead_id_text: leadIdText || null,
-      customer_request_id: isUuid(requestRow?.id) ? requestRow.id : null,
-      chat_id: chatId,
-      file_name: fileName,
-      mime_type: mimeType,
-      file_size: buffer.length,
-      storage_bucket: storage.bucket,
-      storage_path: storage.path,
-      source: "customer_ai_chat",
-      status: "temporary",
-      temporary: true,
-      expires_at: expiresAt,
-      metadata: { originalSize: Number(file.size || 0) || buffer.length, uploadedFrom: "customer_chat" },
-    }]);
+    const leadIdText = requestRow?.estimate_data?.leadId || mergedCustomer?.leadId || mergedCustomer?.lead_id || null;
+    const leadUuid = requestRow?.estimate_data?.leadUuid || mergedCustomer?.leadUuid || null;
+    const legacyFileUrl = `supabase://${storage.bucket}/${storage.path}`;
+
+    // Populate both the old Buildup attachment columns and the newer customer-chat columns.
+    // This keeps existing Supabase projects compatible and avoids the old file_url NOT NULL error.
+    let inserted;
+    try {
+      inserted = await dbInsert("attachments", [{
+        lead_id: isUuid(leadUuid) ? leadUuid : null,
+        lead_uuid: isUuid(leadUuid) ? leadUuid : null,
+        lead_id_text: leadIdText || null,
+        customer_request_id: isUuid(requestRow?.id) ? requestRow.id : null,
+        chat_id: chatId,
+        file_name: fileName,
+        file_url: legacyFileUrl,
+        file_type: mimeType,
+        mime_type: mimeType,
+        file_size: buffer.length,
+        attachment_type: "customer_document",
+        storage_bucket: storage.bucket,
+        storage_path: storage.path,
+        source: "customer_ai_chat",
+        status: analysis ? "analyzed" : "analysis_failed",
+        temporary: true,
+        expires_at: expiresAt,
+        storage_verified: true,
+        storage_verified_at: storageVerification.verifiedAt,
+        analysis_status: analysis ? "completed" : "failed",
+        analysis_model: analysisResult?.model || DOCUMENT_ANALYSIS_MODEL,
+        analysis_result: analysis,
+        analysis_error: analysisError,
+        metadata: {
+          originalSize: Number(file.size || 0) || buffer.length,
+          uploadedFrom: "customer_chat",
+          storageVerified: true,
+          storageVerifiedAt: storageVerification.verifiedAt,
+          analysisStatus: analysis ? "completed" : "failed",
+          analysisModel: analysisResult?.model || DOCUMENT_ANALYSIS_MODEL,
+          analysisResponseId: analysisResult?.responseId || null,
+          analysis,
+          analysisError,
+        },
+      }]);
+    } catch (error) {
+      await deleteCustomerDocumentObject(storage.path);
+      uploadedStoragePath = "";
+      throw new Error(`The file reached Supabase Storage, but the attachments table rejected its metadata: ${error?.message || error}. Run SQL_PHASE52_ATTACHMENT_ANALYSIS_MIGRATION.sql.`);
+    }
+
     const attachment = Array.isArray(inserted) && inserted[0] ? inserted[0] : null;
-    if (!attachment?.id) throw new Error("Document file was uploaded, but its database record could not be created.");
+    if (!attachment?.id) {
+      await deleteCustomerDocumentObject(storage.path);
+      uploadedStoragePath = "";
+      throw new Error("Document file was uploaded, but its database record could not be created.");
+    }
+
+    // 5) Read the row back: the API only reports success after Storage and DB metadata both exist.
+    const verifiedRows = await dbSelect("attachments", `select=*&id=eq.${encodeEq(attachment.id)}&limit=1`);
+    const verifiedAttachment = Array.isArray(verifiedRows) ? verifiedRows[0] : null;
+    if (!verifiedAttachment?.id || !verifiedAttachment?.storage_path) {
+      throw new Error("Attachment verification failed after database insert.");
+    }
 
     await writeAuditLog(req, {
-      action_type: "customer_document_stored",
+      action_type: analysis ? "customer_document_analyzed" : "customer_document_analysis_failed",
       module: "auto_quote",
       target_table: "attachments",
       target_id: attachment.id,
-      new_snapshot: { ...attachment, storage_path: storage.path },
-      change_summary: `Customer document ${fileName} stored temporarily and linked to chat ${chatId}.`,
+      new_snapshot: { ...verifiedAttachment, storage_path: storage.path },
+      change_summary: analysis
+        ? `Customer document ${fileName} was stored, verified and analyzed for chat ${chatId}.`
+        : `Customer document ${fileName} was stored and verified, but analysis failed for chat ${chatId}.`,
     });
 
-    res.json({
+    res.status(analysis ? 200 : 207).json({
       ok: true,
       success: true,
       stored: true,
+      storageVerified: true,
+      analyzed: Boolean(analysis),
+      analysisError,
       storage: "supabase_storage+attachments",
       attachment: {
-        id: attachment.id,
-        fileName: attachment.file_name,
-        mimeType: attachment.mime_type,
-        fileSize: attachment.file_size,
-        storageBucket: attachment.storage_bucket,
-        storagePath: attachment.storage_path,
-        temporary: attachment.temporary,
-        expiresAt: attachment.expires_at,
+        id: verifiedAttachment.id,
+        fileName: verifiedAttachment.file_name,
+        mimeType: verifiedAttachment.mime_type || verifiedAttachment.file_type,
+        fileSize: verifiedAttachment.file_size,
+        storageBucket: verifiedAttachment.storage_bucket,
+        storagePath: verifiedAttachment.storage_path,
+        temporary: verifiedAttachment.temporary,
+        expiresAt: verifiedAttachment.expires_at,
+        databaseVerified: true,
       },
+      analysis,
+      customerUpdates: analysis?.customerUpdates || {},
+      items: analysis?.items || [],
+      reply: analysis?.reply || null,
       request: requestRow,
       savedTo: {
-        file: { service: "Supabase Storage", bucket: storage.bucket, path: storage.path },
-        metadata: { table: "attachments", id: attachment.id },
+        file: { service: "Supabase Storage", bucket: storage.bucket, path: storage.path, verified: true },
+        metadata: { table: "attachments", id: verifiedAttachment.id, verified: true },
         chat: { table: "customer_requests", id: requestRow?.id || null, chatId },
+        lead: leadIdText ? { table: "leads", id: leadUuid || null, leadId: leadIdText } : null,
       },
     });
   } catch (error) {
-    rememberSupabaseIssue("customer document upload", error);
-    res.status(500).json({ ok: false, success: false, stored: false, error: error.message || "Could not store uploaded document." });
+    if (uploadedStoragePath) {
+      // Only clean up when the workflow failed before a usable DB record was confirmed.
+      console.warn("Customer document workflow failed after upload:", error?.message || error);
+    }
+    rememberSupabaseIssue("customer document upload/analyze", error);
+    res.status(500).json({
+      ok: false,
+      success: false,
+      stored: false,
+      analyzed: false,
+      error: error.message || "Could not store and analyze the uploaded document.",
+    });
   }
 });
 
@@ -3609,7 +3894,7 @@ app.get("/notifications", requireStaff, async (req, res) => {
       success: true,
       databaseEnabled: SUPABASE_ENABLED,
       sections,
-      agentRequests: handoffRequests.slice(-50).reverse(),
+      agentRequests: sections.realAgent,
     });
   } catch (error) {
     rememberSupabaseIssue("notifications load", error);
@@ -3773,35 +4058,70 @@ app.post("/local-backup", requireStaff, async (req, res) => {
   }
 });
 
-app.get("/agent-requests", requireStaff, (req, res) => {
-  res.json({ success: true, requests: handoffRequests.slice(-50).reverse() });
+app.get("/agent-requests", requireStaff, async (req, res) => {
+  try {
+    const rows = await loadCustomerRequestRows(200);
+    const requests = notificationSectionsFromRequests(rows).realAgent;
+    res.json({ ok: true, success: true, requests, storage: SUPABASE_ENABLED ? "supabase" : "local-fallback" });
+  } catch (error) {
+    rememberSupabaseIssue("agent requests load", error);
+    res.status(500).json({ ok: false, success: false, error: "Could not load real-agent requests from the database." });
+  }
 });
 
 app.post("/agent-request", async (req, res) => {
-  const body = req.body || {};
-  const request = {
-    id: `handoff_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-    createdAt: new Date().toISOString(),
-    status: "waiting",
-    customer: body.customer || {},
-    messages: normalizeMessages(body.messages || []),
-    note: normalizeContent(body.note || "Customer requested a real staff member."),
-  };
-  handoffRequests.push(request);
   try {
-    await recordCustomerRequest({
-      chatId: body.chatId || body.id || null,
+    if (!SUPABASE_ENABLED) {
+      return res.status(503).json({ ok: false, success: false, error: "Supabase is not configured. The real-agent request was not saved." });
+    }
+    const body = req.body || {};
+    const chatId = String(body.chatId || body.id || "").trim();
+    if (!chatId) return res.status(400).json({ ok: false, success: false, error: "Missing chat session ID." });
+    const createdAt = new Date().toISOString();
+    const deadlineAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    const request = {
+      id: String(body.requestId || body.id || `handoff_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`),
+      chatId,
+      createdAt,
+      deadlineAt,
+      status: "waiting",
+      customer: body.customer || {},
+      messages: normalizeMessages(body.messages || body.conversation || []),
+      note: normalizeContent(body.note || "Customer requested a real staff member."),
+    };
+
+    const requestRow = await recordCustomerRequest({
+      chatId,
       customer: request.customer,
       conversation: request.messages,
       status: "real_agent_requested",
       eventType: "real_agent_requested",
       note: request.note,
-      estimate_data: { handoffRequest: request },
+      estimate_data: {
+        chatId,
+        sessionStatus: "real_agent_requested",
+        handoffRequest: request,
+        handoffRequestId: request.id,
+        handoffRequestedAt: createdAt,
+        handoffDeadlineAt: deadlineAt,
+        handoffPhoneShared: false,
+        agentResponseStatus: "waiting",
+      },
     }, req);
+
+    handoffRequests.push(request);
+    res.json({
+      ok: true,
+      success: true,
+      request,
+      databaseRequest: requestRow,
+      handoffDeadlineAt: deadlineAt,
+      savedTo: { table: "customer_requests", id: requestRow?.id || null, chatId },
+    });
   } catch (error) {
     rememberSupabaseIssue("agent request save", error);
+    res.status(500).json({ ok: false, success: false, error: error.message || "Could not save the real-agent request." });
   }
-  res.json({ success: true, request, staffContactName: STAFF_CONTACT_NAME, staffContactPhone: STAFF_CONTACT_PHONE });
 });
 
 
