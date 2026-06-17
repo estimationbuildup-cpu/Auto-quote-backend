@@ -354,7 +354,7 @@ function normalizeDocumentAnalysis(raw = {}, fileName = "uploaded-file") {
   };
 }
 
-async function analyzeCustomerDocument({ fileName, mimeType, dataUrl, buffer, customer = {}, messages = [] }) {
+async function analyzeCustomerDocument({ fileName, mimeType, dataUrl, buffer, customer = {}, messages = [], caption = "" }) {
   if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is missing, so the stored document cannot be analyzed.");
   const analysisPrompt = `You are the document and image analysis assistant for Buildup Glass & Aluminum in the UAE.
 
@@ -390,6 +390,7 @@ Return valid JSON only with this shape:
 }
 
 Known customer: ${JSON.stringify(customer || {})}
+Customer instruction/caption attached to this file: ${JSON.stringify(String(caption || "").trim() || null)}
 Recent chat: ${JSON.stringify((Array.isArray(messages) ? messages : []).slice(-12))}`;
 
   const content = [{ type: "input_text", text: analysisPrompt }];
@@ -3728,6 +3729,7 @@ app.post("/customer-document", async (req, res) => {
     const body = req.body || {};
     const file = body.file || {};
     const chatId = String(body.chatId || "").trim();
+    const caption = String(body.caption || "").trim();
     if (!chatId) throw new Error("Chat ID is required before storing a document.");
     if (!file.dataUrl) throw new Error("No document data was received.");
 
@@ -3745,6 +3747,12 @@ app.post("/customer-document", async (req, res) => {
 
     // 2) Prove that the exact object can be read back from Supabase Storage.
     const storageVerification = await verifyCustomerDocumentObject(storage.path);
+    let previewUrl = "";
+    try {
+      previewUrl = await createCustomerDocumentSignedUrl(storage.path, 60 * 60);
+    } catch (error) {
+      console.warn("Could not create customer attachment preview URL:", error?.message || error);
+    }
 
     // 3) Analyze the actual image/PDF content with a multimodal OpenAI model.
     let analysisResult = null;
@@ -3757,6 +3765,7 @@ app.post("/customer-document", async (req, res) => {
         buffer,
         customer: body.customer || {},
         messages: body.messages || body.conversation || [],
+        caption,
       });
     } catch (error) {
       analysisError = error?.message || "The document could not be analyzed.";
@@ -3786,6 +3795,7 @@ app.post("/customer-document", async (req, res) => {
       analysisStatus: analysis ? "completed" : "failed",
       analysis: analysis || null,
       analysisError,
+      caption: caption || null,
     };
     const analysisMessage = analysis?.reply
       ? {
@@ -3865,6 +3875,7 @@ app.post("/customer-document", async (req, res) => {
           analysisStatus: analysis ? "completed" : "failed",
           analysisModel: analysisResult?.model || DOCUMENT_ANALYSIS_MODEL,
           analysisResponseId: analysisResult?.responseId || null,
+          caption: caption || null,
           analysis,
           analysisError,
         },
@@ -3918,6 +3929,7 @@ app.post("/customer-document", async (req, res) => {
         fileSize: verifiedAttachment.file_size,
         storageBucket: verifiedAttachment.storage_bucket,
         storagePath: verifiedAttachment.storage_path,
+        previewUrl: previewUrl || null,
         temporary: verifiedAttachment.temporary,
         expiresAt: verifiedAttachment.expires_at,
         databaseVerified: true,
