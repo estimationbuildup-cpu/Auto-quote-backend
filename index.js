@@ -3935,6 +3935,7 @@ app.post("/customer-document", async (req, res) => {
         databaseVerified: true,
       },
       analysis,
+      analysisMessage,
       customerUpdates: analysis?.customerUpdates || {},
       items: analysis?.items || [],
       reply: analysis?.reply || null,
