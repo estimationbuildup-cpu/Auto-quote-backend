@@ -12,9 +12,39 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 const DEFAULT_OPENAI_MODEL = "gpt-5.5";
-const MODEL = String(process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL).trim();
-const WEB_SEARCH_MODEL = String(process.env.OPENAI_WEB_SEARCH_MODEL || MODEL).trim();
-const DOCUMENT_ANALYSIS_MODEL = String(process.env.OPENAI_DOCUMENT_MODEL || "gpt-4o").trim();
+
+function normalizeOpenAIModelId(value, fallback = "") {
+  const raw = String(value || fallback || "").trim();
+  const key = raw.toLowerCase().replace(/\s+/g, "");
+  const aliases = {
+    "gpt4o": "gpt-4o",
+    "gpt-4-o": "gpt-4o",
+    "gpt4omini": "gpt-4o-mini",
+    "gpt-4-o-mini": "gpt-4o-mini",
+    "gpt5": "gpt-5",
+    "gpt5.4": "gpt-5.4",
+    "gpt54": "gpt-5.4",
+    "gpt5.5": "gpt-5.5",
+    "gpt55": "gpt-5.5",
+  };
+  return aliases[key] || raw;
+}
+
+function uniqueModelList(values = []) {
+  return [...new Set(values.map((value) => normalizeOpenAIModelId(value)).filter(Boolean))];
+}
+
+const MODEL = normalizeOpenAIModelId(process.env.OPENAI_MODEL, DEFAULT_OPENAI_MODEL);
+const WEB_SEARCH_MODEL = normalizeOpenAIModelId(process.env.OPENAI_WEB_SEARCH_MODEL, MODEL);
+// The document engine is intentionally separate from normal chat. If Render does not
+// inject OPENAI_DOCUMENT_MODEL, the fallback is now GPT-5.5 — never the old GPT-4o.
+const DOCUMENT_ANALYSIS_MODEL = normalizeOpenAIModelId(process.env.OPENAI_DOCUMENT_MODEL, "gpt-5.5");
+const DOCUMENT_ANALYSIS_FALLBACK_MODELS = uniqueModelList([
+  DOCUMENT_ANALYSIS_MODEL,
+  ...String(process.env.OPENAI_DOCUMENT_FALLBACK_MODELS || "gpt-5.4,gpt-5,gpt-4.1")
+    .split(",")
+    .map((value) => value.trim()),
+]);
 const ENABLE_WEB_SEARCH = process.env.ENABLE_WEB_SEARCH !== "false";
 const STAFF_CONTACT_NAME = process.env.STAFF_CONTACT_NAME || "Jithin";
 const STAFF_CONTACT_PHONE = process.env.AGENT_FALLBACK_PHONE || process.env.JITHIN_CONTACT_PHONE || "+971559665623";
@@ -369,19 +399,49 @@ Recent chat: ${JSON.stringify((Array.isArray(messages) ? messages : []).slice(-1
     content.unshift({ type: "input_image", image_url: dataUrl, detail: "high" });
   }
 
-  const response = await client.responses.create({
-    model: DOCUMENT_ANALYSIS_MODEL,
-    input: [{ role: "user", content }],
-    max_output_tokens: 2200,
-    store: false,
-  });
-  const rawText = response.output_text || "{}";
-  return {
-    analysis: normalizeDocumentAnalysis(safeParseJson(rawText), fileName),
-    model: DOCUMENT_ANALYSIS_MODEL,
-    responseId: response.id || null,
-    usage: response.usage || null,
-  };
+  const attemptedModels = [];
+  let lastModelError = null;
+
+  for (const model of DOCUMENT_ANALYSIS_FALLBACK_MODELS) {
+    attemptedModels.push(model);
+    try {
+      const request = {
+        model,
+        input: [{ role: "user", content }],
+        max_output_tokens: 2200,
+        store: false,
+      };
+      if (model.startsWith("gpt-5")) {
+        request.reasoning = { effort: String(process.env.OPENAI_DOCUMENT_REASONING_EFFORT || "high").trim() || "high" };
+      }
+      const response = await client.responses.create(request);
+      const rawText = response.output_text || "{}";
+      return {
+        analysis: normalizeDocumentAnalysis(safeParseJson(rawText), fileName),
+        model,
+        configuredModel: DOCUMENT_ANALYSIS_MODEL,
+        attemptedModels,
+        responseId: response.id || null,
+        usage: response.usage || null,
+      };
+    } catch (error) {
+      const message = String(error?.message || error || "");
+      const code = String(error?.code || error?.error?.code || "").toLowerCase();
+      const unavailable = Number(error?.status) === 404
+        || code === "model_not_found"
+        || code === "invalid_model"
+        || /model.+(does not exist|not found|no access|do not have access|not available|unavailable)/i.test(message);
+      if (!unavailable) throw error;
+      lastModelError = error;
+      console.warn(`[Document AI] Model ${model} unavailable; trying the next configured fallback.`);
+    }
+  }
+
+  const lastMessage = String(lastModelError?.message || "No compatible document model was available.");
+  const error = new Error(`Document AI could not access any configured model. Tried: ${attemptedModels.join(", ")}. Last error: ${lastMessage}`);
+  error.code = "document_model_unavailable";
+  error.attemptedModels = attemptedModels;
+  throw error;
 }
 
 function encodeEq(value = "") {
@@ -3646,6 +3706,21 @@ app.post("/customer-request", async (req, res) => {
   }
 });
 
+app.get("/document-engine-status", (_req, res) => {
+  res.json({
+    ok: true,
+    documentEngine: {
+      configuredModel: DOCUMENT_ANALYSIS_MODEL,
+      modelSource: process.env.OPENAI_DOCUMENT_MODEL ? "OPENAI_DOCUMENT_MODEL" : "server_default",
+      fallbackModels: DOCUMENT_ANALYSIS_FALLBACK_MODELS,
+      reasoningEffort: String(process.env.OPENAI_DOCUMENT_REASONING_EFFORT || "high").trim() || "high",
+      openAiKeyConfigured: Boolean(process.env.OPENAI_API_KEY),
+    },
+    normalChatModel: MODEL,
+    build: "phase-53-document-engine-runtime-diagnostics",
+  });
+});
+
 app.post("/customer-document", async (req, res) => {
   let uploadedStoragePath = "";
   try {
@@ -3832,6 +3907,9 @@ app.post("/customer-document", async (req, res) => {
       storageVerified: true,
       analyzed: Boolean(analysis),
       analysisError,
+      configuredDocumentModel: DOCUMENT_ANALYSIS_MODEL,
+      documentModelUsed: analysisResult?.model || null,
+      attemptedDocumentModels: analysisResult?.attemptedModels || (analysis ? [analysisResult?.model].filter(Boolean) : DOCUMENT_ANALYSIS_FALLBACK_MODELS),
       storage: "supabase_storage+attachments",
       attachment: {
         id: verifiedAttachment.id,
@@ -4369,4 +4447,5 @@ app.post("/ai-estimate", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`AI quote server running on port ${PORT}`);
+  console.log(`[Document AI] configured=${DOCUMENT_ANALYSIS_MODEL}; source=${process.env.OPENAI_DOCUMENT_MODEL ? "OPENAI_DOCUMENT_MODEL" : "server_default"}; fallbacks=${DOCUMENT_ANALYSIS_FALLBACK_MODELS.join(",")}`);
 });
